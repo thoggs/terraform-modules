@@ -865,7 +865,7 @@ jobs:
 EOF
 log_success "Created .github/workflows/cd.yml"
 
-# Create CD Terraform workflow (only runs when infra changes)
+# Create CD Terraform workflow
 cat > "$WORKFLOWS_DIR/cd-terraform.yml" << EOF
 name: CD Terraform
 
@@ -873,8 +873,8 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'infra/**'
+    paths-ignore:
+      - '*.md'
 
 permissions:
   contents: read
@@ -894,64 +894,91 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Check for infra changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            infra:
+              - 'infra/**'
 
       - name: Authenticate to Google Cloud
+        if: steps.filter.outputs.infra == 'true'
         uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: \${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
       - name: Set up Cloud SDK
+        if: steps.filter.outputs.infra == 'true'
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure Docker
+        if: steps.filter.outputs.infra == 'true'
         run: gcloud auth configure-docker \${{ env.REGION }}-docker.pkg.dev --quiet
 
       - name: Enable Corepack
+        if: steps.filter.outputs.infra == 'true'
         run: corepack enable
 
       - name: Setup Node.js
+        if: steps.filter.outputs.infra == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: lts/*
           cache: yarn
 
       - name: Install dependencies
+        if: steps.filter.outputs.infra == 'true'
         run: yarn install --immutable
 
       - name: Build application
+        if: steps.filter.outputs.infra == 'true'
         run: yarn build
         env:
           NODE_ENV: production
 
       - name: Build Docker image
+        if: steps.filter.outputs.infra == 'true'
         run: |
           docker build -t \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} .
           docker tag \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
 
       - name: Push Docker image
+        if: steps.filter.outputs.infra == 'true'
         run: |
           docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
           docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
 
       - name: Create terraform.tfvars
+        if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
         run: |
           echo '\${{ secrets.TERRAFORM_TFVARS }}' > terraform.tfvars
           echo 'image_tag = "\${{ github.sha }}"' >> terraform.tfvars
 
       - name: Setup Terraform
+        if: steps.filter.outputs.infra == 'true'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.5"
 
       - name: Terraform Init
+        if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
         run: terraform init
 
       - name: Terraform Apply
+        if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
         run: terraform apply -var-file=terraform.tfvars -auto-approve -input=false
+
+      - name: No infra changes
+        if: steps.filter.outputs.infra != 'true'
+        run: echo "No infrastructure changes detected, skipping Terraform"
 EOF
 log_success "Created .github/workflows/cd-terraform.yml"
 
