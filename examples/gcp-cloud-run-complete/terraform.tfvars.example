@@ -1,0 +1,38 @@
+# ============================================
+# PROJECT CONFIGURATION
+# ============================================
+project_id   = "your-project-id"
+region       = "us-central1"
+service_name = "your-service"
+github_repo  = "your-username/your-repo"
+
+# ============================================
+# CLOUD RUN RESOURCES
+# ============================================
+cpu           = "1"
+memory        = "512Mi"
+min_instances = 0    # 0 = scale to zero (cold start), 1 = always warm
+max_instances = 2
+
+# ============================================
+# DOMAIN (optional)
+# ============================================
+custom_domain       = ""  # e.g., "app.yourdomain.com"
+allow_public_access = true
+deletion_protection = false
+
+# ============================================
+# ENVIRONMENT VARIABLES
+# ============================================
+env_vars = {
+  NODE_ENV = "production"
+  # Add your environment variables here
+}
+
+# ============================================
+# SECRET ENVIRONMENT VARIABLES
+# ============================================
+secret_env_vars = {
+  # API_KEY = "your-secret-value"
+  # DATABASE_URL = "your-database-connection-string"
+}
