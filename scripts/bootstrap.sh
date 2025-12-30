@@ -666,6 +666,11 @@ output "cloud_run_service_account" {
 EOF
 log_success "Created infra/gcp/outputs.tf"
 
+# Format all terraform files
+log_info "Formatting terraform files..."
+terraform -chdir="$INFRA_DIR" fmt > /dev/null
+log_success "Terraform files formatted"
+
 # Create CI workflow
 print_header "Step 7: Creating GitHub Workflows"
 
