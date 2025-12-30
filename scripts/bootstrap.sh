@@ -14,6 +14,39 @@ log_success() { echo -e "${GREEN}✓${NC} $1"; }
 log_warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error() { echo -e "${RED}✗${NC} $1"; }
 
+# Cleanup function (runs by default, skip with --no-cleanup)
+cleanup_existing_resources() {
+  print_header "Cleaning Up Existing Resources"
+
+  log_info "Deleting Cloud Run service (if exists)..."
+  gcloud run services delete "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || true
+
+  log_info "Deleting Artifact Registry (if exists)..."
+  gcloud artifacts repositories delete "$SERVICE_NAME" --location="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || true
+
+  log_info "Deleting secrets (if exist)..."
+  # List and delete all secrets that might have been created
+  for secret in $(gcloud secrets list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null); do
+    gcloud secrets delete "$secret" --project="$PROJECT_ID" --quiet 2>/dev/null || true
+  done
+
+  log_info "Deleting service accounts (if exist)..."
+  gcloud iam service-accounts delete "${SERVICE_NAME}-run@${PROJECT_ID}.iam.gserviceaccount.com" --project="$PROJECT_ID" --quiet 2>/dev/null || true
+  gcloud iam service-accounts delete "github-actions@${PROJECT_ID}.iam.gserviceaccount.com" --project="$PROJECT_ID" --quiet 2>/dev/null || true
+
+  log_info "Deleting Workload Identity Pool (if exists)..."
+  gcloud iam workload-identity-pools delete github-pool --location=global --project="$PROJECT_ID" --quiet 2>/dev/null || true
+
+  log_info "Clearing Terraform state bucket (if exists)..."
+  gcloud storage rm -r "gs://${PROJECT_ID}-tfstate/**" 2>/dev/null || true
+
+  log_info "Removing local infra and workflow files..."
+  rm -rf "$OUTPUT_DIR/infra" "$OUTPUT_DIR/.github/workflows" 2>/dev/null || true
+
+  log_success "Cleanup complete!"
+  echo ""
+}
+
 print_header() {
   echo ""
   echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
@@ -73,6 +106,10 @@ while [[ $# -gt 0 ]]; do
       ENV_FILE="${1#*=}"
       shift
       ;;
+    --no-cleanup)
+      NO_CLEANUP=true
+      shift
+      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
@@ -89,6 +126,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --custom-domain=DOMAIN     Custom domain for Cloud Run (e.g., app.example.com)"
       echo "  --provider=PROVIDER        Cloud provider: gcp (default), aws*, azure* (*coming soon)"
       echo "  --env-file=PATH            Environment file to process (auto-detects .env.local)"
+      echo "  --no-cleanup               Skip cleanup of existing resources (cleanup runs by default)"
       echo "  --help                     Show this help"
       echo ""
       echo "Example:"
@@ -166,6 +204,11 @@ echo "  Output Dir:       $OUTPUT_DIR"
 if [[ -n "$CUSTOM_DOMAIN" ]]; then
   echo "  Custom Domain:    $CUSTOM_DOMAIN"
 fi
+if [[ "$NO_CLEANUP" == "true" ]]; then
+  echo "  Cleanup:          skip"
+else
+  echo "  Cleanup:          yes (use --no-cleanup to skip)"
+fi
 echo ""
 
 # Check gcloud auth
@@ -212,6 +255,11 @@ fi
 # Set project and quota project
 gcloud config set project "$PROJECT_ID"
 gcloud auth application-default set-quota-project "$PROJECT_ID" --quiet 2>/dev/null || true
+
+# Run cleanup by default (skip with --no-cleanup)
+if [[ "$NO_CLEANUP" != "true" ]]; then
+  cleanup_existing_resources
+fi
 
 # Enable APIs
 print_header "Step 3: Enabling APIs"
