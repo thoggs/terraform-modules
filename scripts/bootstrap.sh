@@ -638,7 +638,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
   terraform plan -var-file=terraform.tfvars -out=tfplan
 
   echo ""
-  read -p "Apply this plan? (y/n) " -n 1 -r
+  read -p "Apply this plan? (y/n) " -n 1 -r < /dev/tty
   echo ""
 
   if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -668,7 +668,7 @@ if command -v gh &> /dev/null; then
     log_success "GitHub CLI authenticated"
 
     echo ""
-    read -p "Configure GitHub secrets automatically? (y/n) " -n 1 -r
+    read -p "Configure GitHub secrets automatically? (y/n) " -n 1 -r < /dev/tty
     echo ""
 
     if [[ $REPLY =~ ^[Yy]$ ]]; then
