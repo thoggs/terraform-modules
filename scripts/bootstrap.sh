@@ -212,8 +212,69 @@ else
   log_success "Bucket created"
 fi
 
+# Create Artifact Registry and push initial image
+print_header "Step 5: Building & Pushing Initial Docker Image"
+
+ARTIFACT_REGISTRY="$REGION-docker.pkg.dev/$PROJECT_ID/$SERVICE_NAME"
+IMAGE_NAME="$ARTIFACT_REGISTRY/$SERVICE_NAME:latest"
+
+# Create Artifact Registry if it doesn't exist
+if ! gcloud artifacts repositories describe "$SERVICE_NAME" --location="$REGION" &>/dev/null; then
+  log_info "Creating Artifact Registry: $SERVICE_NAME"
+  gcloud artifacts repositories create "$SERVICE_NAME" \
+    --repository-format=docker \
+    --location="$REGION" \
+    --description="Docker repository for $SERVICE_NAME"
+  log_success "Artifact Registry created"
+else
+  log_warn "Artifact Registry $SERVICE_NAME already exists"
+fi
+
+# Configure Docker authentication
+log_info "Configuring Docker authentication..."
+gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+log_success "Docker configured"
+
+# Check if Dockerfile exists in output directory
+if [[ -f "$OUTPUT_DIR/Dockerfile" ]]; then
+  # Check if Node.js build is needed (package.json exists)
+  if [[ -f "$OUTPUT_DIR/package.json" ]]; then
+    log_info "Running application build..."
+    cd "$OUTPUT_DIR"
+
+    if command -v yarn &>/dev/null && [[ -f "yarn.lock" ]]; then
+      yarn install --immutable 2>/dev/null || yarn install
+      yarn build
+    elif command -v npm &>/dev/null; then
+      npm ci 2>/dev/null || npm install
+      npm run build
+    fi
+
+    cd - > /dev/null
+    log_success "Application built"
+  fi
+
+  log_info "Building Docker image (linux/amd64)..."
+
+  # Use buildx for multiplatform build
+  if docker buildx version &>/dev/null; then
+    # Create builder if needed
+    docker buildx create --name multiarch --use 2>/dev/null || docker buildx use multiarch 2>/dev/null || true
+    docker buildx build --platform linux/amd64 -t "$IMAGE_NAME" "$OUTPUT_DIR" --push
+  else
+    docker build -t "$IMAGE_NAME" "$OUTPUT_DIR"
+    log_info "Pushing image to Artifact Registry..."
+    docker push "$IMAGE_NAME"
+  fi
+
+  log_success "Image pushed: $IMAGE_NAME"
+else
+  log_warn "No Dockerfile found in $OUTPUT_DIR - skipping image build"
+  log_warn "You'll need to build and push the image manually before terraform apply"
+fi
+
 # Create directory structure
-print_header "Step 5: Creating Project Structure"
+print_header "Step 6: Creating Project Structure"
 
 mkdir -p "$INFRA_DIR"
 mkdir -p "$WORKFLOWS_DIR"
@@ -439,7 +500,7 @@ EOF
 log_success "Created infra/gcp/outputs.tf"
 
 # Create CI workflow
-print_header "Step 6: Creating GitHub Workflows"
+print_header "Step 7: Creating GitHub Workflows"
 
 cat > "$WORKFLOWS_DIR/ci.yml" << EOF
 name: CI
@@ -464,10 +525,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: \${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
@@ -499,13 +560,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Enable Corepack
         run: corepack enable
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: lts/*
           cache: yarn
@@ -548,10 +609,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: \${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
@@ -627,7 +688,7 @@ log_success "Created infra/gcp/terraform.tfvars.example"
 
 # Run terraform if not skipped
 if [[ "$SKIP_TERRAFORM" != "true" ]]; then
-  print_header "Step 7: Running Terraform"
+  print_header "Step 8: Running Terraform"
 
   cd "$INFRA_DIR"
 
@@ -659,7 +720,7 @@ else
 fi
 
 # Configure GitHub secrets
-print_header "Step 8: GitHub Secrets Configuration"
+print_header "Step 9: GitHub Secrets Configuration"
 
 if command -v gh &> /dev/null; then
   log_info "GitHub CLI detected. Checking authentication..."
