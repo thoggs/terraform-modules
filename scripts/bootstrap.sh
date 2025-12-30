@@ -327,9 +327,16 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
   echo "└────────────────────────────────────────────────────────────────────┘"
   echo ""
 
-  declare -A ENV_MAP
-  declare -A SECRET_MAP
+  # Use temp files instead of associative arrays (bash 3.x compatibility)
+  ENV_KEYS_FILE=$(mktemp)
+  ENV_VALUES_FILE=$(mktemp)
+  SECRET_KEYS_FILE=$(mktemp)
+  SECRET_VALUES_FILE=$(mktemp)
+  trap "rm -f $ENV_KEYS_FILE $ENV_VALUES_FILE $SECRET_KEYS_FILE $SECRET_VALUES_FILE" EXIT
+
   next_is_secret=false
+  env_count=0
+  secret_count=0
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     # Skip empty lines
@@ -360,11 +367,15 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
 
       # Classify based on marker
       if [[ "$next_is_secret" == "true" ]]; then
-        SECRET_MAP["$key"]="$value"
+        echo "$key" >> "$SECRET_KEYS_FILE"
+        echo "$value" >> "$SECRET_VALUES_FILE"
         log_info "  [SECRET] $key"
+        ((secret_count++))
       else
-        ENV_MAP["$key"]="$value"
+        echo "$key" >> "$ENV_KEYS_FILE"
+        echo "$value" >> "$ENV_VALUES_FILE"
         log_info "  [ENV] $key"
+        ((env_count++))
       fi
 
       # Reset marker for next variable
@@ -375,11 +386,11 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
   # Show summary and ask for confirmation
   echo ""
   echo "Summary:"
-  echo "  Public env vars:  ${#ENV_MAP[@]}"
-  echo "  Secret env vars:  ${#SECRET_MAP[@]}"
+  echo "  Public env vars:  $env_count"
+  echo "  Secret env vars:  $secret_count"
   echo ""
 
-  if [[ ${#SECRET_MAP[@]} -gt 0 ]]; then
+  if [[ $secret_count -gt 0 ]]; then
     read -p "Continue with this classification? (y/n) " -n 1 -r < /dev/tty
     echo ""
 
@@ -390,35 +401,37 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
   fi
 
   # Create secrets in GCP Secret Manager
-  if [[ ${#SECRET_MAP[@]} -gt 0 ]]; then
+  if [[ $secret_count -gt 0 ]]; then
     log_info "Creating secrets in GCP Secret Manager..."
 
-    for key in "${!SECRET_MAP[@]}"; do
+    while IFS= read -r key && IFS= read -r value <&3; do
       secret_name=$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
 
       # Check if secret exists
       if gcloud secrets describe "$secret_name" &>/dev/null; then
         log_warn "Secret $secret_name already exists, adding new version..."
-        echo -n "${SECRET_MAP[$key]}" | gcloud secrets versions add "$secret_name" --data-file=-
+        echo -n "$value" | gcloud secrets versions add "$secret_name" --data-file=-
       else
         log_info "Creating secret: $secret_name"
-        echo -n "${SECRET_MAP[$key]}" | gcloud secrets create "$secret_name" --data-file=- --replication-policy="automatic"
+        echo -n "$value" | gcloud secrets create "$secret_name" --data-file=- --replication-policy="automatic"
       fi
 
       # Build terraform secret_env_vars
       SECRET_ENV_VARS_TF+="  $key = \"$secret_name\"\n"
-    done
+    done < "$SECRET_KEYS_FILE" 3< "$SECRET_VALUES_FILE"
 
     log_success "Secrets created in Secret Manager"
   fi
 
   # Build terraform env_vars
   ENV_VARS_TF="  NODE_ENV = \"production\"\n"
-  for key in "${!ENV_MAP[@]}"; do
-    # Escape special characters for terraform
-    escaped_value=$(echo "${ENV_MAP[$key]}" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    ENV_VARS_TF+="  $key = \"$escaped_value\"\n"
-  done
+  if [[ $env_count -gt 0 ]]; then
+    while IFS= read -r key && IFS= read -r value <&3; do
+      # Escape special characters for terraform
+      escaped_value=$(echo "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      ENV_VARS_TF+="  $key = \"$escaped_value\"\n"
+    done < "$ENV_KEYS_FILE" 3< "$ENV_VALUES_FILE"
+  fi
 
   log_success "Environment variables processed"
 else
