@@ -177,8 +177,9 @@ else
   log_success "Project exists"
 fi
 
-# Set project
+# Set project and quota project
 gcloud config set project "$PROJECT_ID"
+gcloud auth application-default set-quota-project "$PROJECT_ID" --quiet 2>/dev/null || true
 
 # Enable APIs
 print_header "Step 3: Enabling APIs"
