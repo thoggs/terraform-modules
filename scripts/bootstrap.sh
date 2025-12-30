@@ -14,7 +14,7 @@ log_success() { echo -e "${GREEN}✓${NC} $1"; }
 log_warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error() { echo -e "${RED}✗${NC} $1"; }
 
-# Cleanup function (runs by default, skip with --no-cleanup)
+# Cleanup function (only runs with --force-cleanup)
 cleanup_existing_resources() {
   print_header "Cleaning Up Existing Resources"
 
@@ -106,8 +106,8 @@ while [[ $# -gt 0 ]]; do
       ENV_FILE="${1#*=}"
       shift
       ;;
-    --no-cleanup)
-      NO_CLEANUP=true
+    --force-cleanup)
+      FORCE_CLEANUP=true
       shift
       ;;
     --help)
@@ -126,7 +126,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --custom-domain=DOMAIN     Custom domain for Cloud Run (e.g., app.example.com)"
       echo "  --provider=PROVIDER        Cloud provider: gcp (default), aws*, azure* (*coming soon)"
       echo "  --env-file=PATH            Environment file to process (auto-detects .env.local)"
-      echo "  --no-cleanup               Skip cleanup of existing resources (cleanup runs by default)"
+      echo "  --force-cleanup            Delete ALL existing resources before running (DESTRUCTIVE)"
       echo "  --help                     Show this help"
       echo ""
       echo "Example:"
@@ -204,10 +204,8 @@ echo "  Output Dir:       $OUTPUT_DIR"
 if [[ -n "$CUSTOM_DOMAIN" ]]; then
   echo "  Custom Domain:    $CUSTOM_DOMAIN"
 fi
-if [[ "$NO_CLEANUP" == "true" ]]; then
-  echo "  Cleanup:          skip"
-else
-  echo "  Cleanup:          yes (use --no-cleanup to skip)"
+if [[ "$FORCE_CLEANUP" == "true" ]]; then
+  echo "  Force Cleanup:    YES (will delete existing resources!)"
 fi
 echo ""
 
@@ -256,8 +254,8 @@ fi
 gcloud config set project "$PROJECT_ID"
 gcloud auth application-default set-quota-project "$PROJECT_ID" --quiet 2>/dev/null || true
 
-# Run cleanup by default (skip with --no-cleanup)
-if [[ "$NO_CLEANUP" != "true" ]]; then
+# Run cleanup only if --force-cleanup is set
+if [[ "$FORCE_CLEANUP" == "true" ]]; then
   cleanup_existing_resources
 fi
 
