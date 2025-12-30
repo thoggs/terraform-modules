@@ -889,7 +889,7 @@ print_header "Step 9: GitHub Secrets Configuration"
 if command -v gh &> /dev/null; then
   log_info "GitHub CLI detected. Checking authentication..."
 
-  if gh auth status &>/dev/null; then
+  if gh auth token &>/dev/null; then
     log_success "GitHub CLI authenticated"
 
     echo ""
