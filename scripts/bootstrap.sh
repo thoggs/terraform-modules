@@ -500,6 +500,9 @@ module "workload_identity" {
 
   project_id  = var.project_id
   github_repo = var.github_repo
+
+  enable_project_iam_admin = true
+  enable_storage_admin     = true
 }
 
 module "artifact_registry" {
