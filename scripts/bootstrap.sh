@@ -693,7 +693,7 @@ jobs:
   terraform:
     name: Terraform Plan
     runs-on: ubuntu-latest
-    environment: production
+    environment: Production
 
     steps:
       - name: Checkout repository
@@ -777,7 +777,7 @@ jobs:
   deploy:
     name: Build & Deploy
     runs-on: ubuntu-latest
-    environment: production
+    environment: Production
 
     steps:
       - name: Checkout repository
@@ -905,26 +905,29 @@ if command -v gh &> /dev/null; then
     echo ""
 
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-      log_info "Configuring GitHub secrets for $GITHUB_REPO..."
+      log_info "Configuring GitHub secrets for $GITHUB_REPO (environment: Production)..."
 
-      # Set secrets
+      # Create Production environment if it doesn't exist
+      gh api "repos/$GITHUB_REPO/environments/Production" --method PUT --silent 2>/dev/null || true
+
+      # Set secrets in Production environment
       if [[ -n "$WIP" ]]; then
-        echo "$WIP" | gh secret set GCP_WORKLOAD_IDENTITY_PROVIDER --repo="$GITHUB_REPO"
+        echo "$WIP" | gh secret set GCP_WORKLOAD_IDENTITY_PROVIDER --repo="$GITHUB_REPO" --env=Production
         log_success "Set GCP_WORKLOAD_IDENTITY_PROVIDER"
       fi
 
       if [[ -n "$SAE" ]]; then
-        echo "$SAE" | gh secret set GCP_SERVICE_ACCOUNT_EMAIL --repo="$GITHUB_REPO"
+        echo "$SAE" | gh secret set GCP_SERVICE_ACCOUNT_EMAIL --repo="$GITHUB_REPO" --env=Production
         log_success "Set GCP_SERVICE_ACCOUNT_EMAIL"
       fi
 
       # Set TERRAFORM_TFVARS
       if [[ -f "$INFRA_DIR/terraform.tfvars" ]]; then
-        gh secret set TERRAFORM_TFVARS --repo="$GITHUB_REPO" < "$INFRA_DIR/terraform.tfvars"
+        gh secret set TERRAFORM_TFVARS --repo="$GITHUB_REPO" --env=Production < "$INFRA_DIR/terraform.tfvars"
         log_success "Set TERRAFORM_TFVARS"
       fi
 
-      log_success "GitHub secrets configured!"
+      log_success "GitHub secrets configured in 'Production' environment!"
     else
       log_warn "Skipped GitHub secrets configuration"
     fi
