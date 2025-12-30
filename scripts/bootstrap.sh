@@ -579,9 +579,9 @@ variable "default_labels" {
 }
 
 variable "deletion_protection" {
-  description = "Enable deletion protection for Cloud Run service"
+  description = "Enable deletion protection for Cloud Run service (enable in production)"
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "allow_public_access" {
