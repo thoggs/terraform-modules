@@ -671,7 +671,7 @@ log_info "Formatting terraform files..."
 terraform -chdir="$INFRA_DIR" fmt > /dev/null
 log_success "Terraform files formatted"
 
-# Create CI workflow
+# Create CI workflow (build only)
 print_header "Step 7: Creating GitHub Workflows"
 
 cat > "$WORKFLOWS_DIR/ci.yml" << EOF
@@ -684,6 +684,46 @@ on:
       - main
     paths-ignore:
       - '*.md'
+
+jobs:
+  build:
+    name: Build & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build application
+        run: yarn build
+        env:
+          NODE_ENV: production
+EOF
+log_success "Created .github/workflows/ci.yml"
+
+# Create CI Terraform workflow (only runs when infra changes)
+cat > "$WORKFLOWS_DIR/ci-terraform.yml" << EOF
+name: CI Terraform
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths:
+      - 'infra/**'
 
 permissions:
   contents: read
@@ -725,35 +765,10 @@ jobs:
       - name: Terraform Plan
         working-directory: infra/gcp
         run: terraform plan -var-file=terraform.tfvars -input=false
-
-  build:
-    name: Build & Validate
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: lts/*
-          cache: yarn
-
-      - name: Install dependencies
-        run: yarn install --immutable
-
-      - name: Build application
-        run: yarn build
-        env:
-          NODE_ENV: production
 EOF
-log_success "Created .github/workflows/ci.yml"
+log_success "Created .github/workflows/ci-terraform.yml"
 
-# Create CD workflow
+# Create CD workflow (build & deploy)
 cat > "$WORKFLOWS_DIR/cd.yml" << EOF
 name: CD
 
@@ -763,6 +778,7 @@ on:
       - main
     paths-ignore:
       - '*.md'
+      - 'infra/**'
 
 permissions:
   contents: read
@@ -795,6 +811,100 @@ jobs:
       - name: Configure Docker
         run: gcloud auth configure-docker \${{ env.REGION }}-docker.pkg.dev --quiet
 
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build application
+        run: yarn build
+        env:
+          NODE_ENV: production
+
+      - name: Build Docker image
+        run: |
+          docker build -t \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} .
+          docker tag \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
+
+      - name: Push Docker image
+        run: |
+          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
+          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run services update \${{ env.SERVICE_NAME }} \\
+            --region=\${{ env.REGION }} \\
+            --image=\${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
+EOF
+log_success "Created .github/workflows/cd.yml"
+
+# Create CD Terraform workflow (only runs when infra changes)
+cat > "$WORKFLOWS_DIR/cd-terraform.yml" << EOF
+name: CD Terraform
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'infra/**'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: $REGION
+  SERVICE_NAME: $SERVICE_NAME
+  PROJECT_ID: $PROJECT_ID
+
+jobs:
+  deploy:
+    name: Build & Deploy (Terraform)
+    runs-on: ubuntu-latest
+    environment: Production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: \${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker
+        run: gcloud auth configure-docker \${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build application
+        run: yarn build
+        env:
+          NODE_ENV: production
+
       - name: Build Docker image
         run: |
           docker build -t \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} .
@@ -824,7 +934,7 @@ jobs:
         working-directory: infra/gcp
         run: terraform apply -var-file=terraform.tfvars -auto-approve -input=false
 EOF
-log_success "Created .github/workflows/cd.yml"
+log_success "Created .github/workflows/cd-terraform.yml"
 
 # Create .gitignore for terraform
 cat > "$INFRA_DIR/.gitignore" << 'EOF'
@@ -1024,8 +1134,10 @@ echo "    ├── terraform.tfvars"
 echo "    ├── terraform.tfvars.example"
 echo "    └── .gitignore"
 echo "  $WORKFLOWS_DIR/"
-echo "    ├── ci.yml"
-echo "    └── cd.yml"
+echo "    ├── ci.yml              (build - always runs)"
+echo "    ├── ci-terraform.yml    (terraform plan - only on infra changes)"
+echo "    ├── cd.yml              (deploy - only on app changes)"
+echo "    └── cd-terraform.yml    (terraform apply - only on infra changes)"
 echo ""
 echo "Next steps:"
 echo "  1. Review generated files"
