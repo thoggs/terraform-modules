@@ -690,9 +690,28 @@ permissions:
   id-token: write
 
 jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      infra: \${{ steps.filter.outputs.infra }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check for changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            infra:
+              - 'infra/**'
+
   terraform:
     name: Terraform Plan
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
     environment: Production
 
     steps:
@@ -774,9 +793,27 @@ env:
   PROJECT_ID: $PROJECT_ID
 
 jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      infra: \${{ steps.filter.outputs.infra }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check for changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            infra:
+              - 'infra/**'
+
   deploy:
     name: Build & Deploy
     runs-on: ubuntu-latest
+    needs: changes
     environment: Production
 
     steps:
@@ -795,6 +832,23 @@ jobs:
       - name: Configure Docker
         run: gcloud auth configure-docker \${{ env.REGION }}-docker.pkg.dev --quiet
 
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build application
+        run: yarn build
+        env:
+          NODE_ENV: production
+
       - name: Build Docker image
         run: |
           docker build -t \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} .
@@ -806,23 +860,34 @@ jobs:
           docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
 
       - name: Create terraform.tfvars
+        if: needs.changes.outputs.infra == 'true'
         working-directory: infra/gcp
         run: |
           echo '\${{ secrets.TERRAFORM_TFVARS }}' > terraform.tfvars
           echo 'image_tag = "\${{ github.sha }}"' >> terraform.tfvars
 
       - name: Setup Terraform
+        if: needs.changes.outputs.infra == 'true'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.5"
 
       - name: Terraform Init
+        if: needs.changes.outputs.infra == 'true'
         working-directory: infra/gcp
         run: terraform init
 
       - name: Terraform Apply
+        if: needs.changes.outputs.infra == 'true'
         working-directory: infra/gcp
         run: terraform apply -var-file=terraform.tfvars -auto-approve -input=false
+
+      - name: Deploy to Cloud Run
+        if: needs.changes.outputs.infra != 'true'
+        run: |
+          gcloud run services update \${{ env.SERVICE_NAME }} \\
+            --region=\${{ env.REGION }} \\
+            --image=\${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
 EOF
 log_success "Created .github/workflows/cd.yml"
 
