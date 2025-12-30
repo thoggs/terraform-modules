@@ -713,7 +713,7 @@ jobs:
 EOF
 log_success "Created .github/workflows/ci.yml"
 
-# Create CI Terraform workflow (only runs when infra changes)
+# Create CI Terraform workflow
 cat > "$WORKFLOWS_DIR/ci-terraform.yml" << EOF
 name: CI Terraform
 
@@ -722,11 +722,12 @@ on:
     branches:
       - develop
       - main
-    paths:
-      - 'infra/**'
+    paths-ignore:
+      - '*.md'
 
 permissions:
   contents: read
+  pull-requests: read
   id-token: write
 
 jobs:
@@ -739,32 +740,50 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Check for infra changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            infra:
+              - 'infra/**'
+
       - name: Authenticate to Google Cloud
+        if: steps.filter.outputs.infra == 'true'
         uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: \${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
       - name: Create terraform.tfvars
+        if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
         run: echo '\${{ secrets.TERRAFORM_TFVARS }}' > terraform.tfvars
 
       - name: Setup Terraform
+        if: steps.filter.outputs.infra == 'true'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.5"
 
       - name: Terraform Init
+        if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
         run: terraform init
 
       - name: Terraform Format
+        if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
         run: terraform fmt -check
 
       - name: Terraform Plan
+        if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
         run: terraform plan -var-file=terraform.tfvars -input=false
+
+      - name: No infra changes
+        if: steps.filter.outputs.infra != 'true'
+        run: echo "No infrastructure changes detected, skipping Terraform"
 EOF
 log_success "Created .github/workflows/ci-terraform.yml"
 
