@@ -69,6 +69,10 @@ while [[ $# -gt 0 ]]; do
       PROVIDER="${1#*=}"
       shift
       ;;
+    --env-file=*)
+      ENV_FILE="${1#*=}"
+      shift
+      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
@@ -84,6 +88,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --skip-terraform           Skip terraform init/plan/apply"
       echo "  --custom-domain=DOMAIN     Custom domain for Cloud Run (e.g., app.example.com)"
       echo "  --provider=PROVIDER        Cloud provider: gcp (default), aws*, azure* (*coming soon)"
+      echo "  --env-file=PATH            Environment file to process (auto-detects .env.local)"
       echo "  --help                     Show this help"
       echo ""
       echo "Example:"
@@ -300,6 +305,127 @@ else
   log_warn "You'll need to build and push the image manually before terraform apply"
 fi
 
+# Process environment variables
+ENV_VARS_TF=""
+SECRET_ENV_VARS_TF=""
+
+# Auto-detect .env.local if --env-file not specified
+if [[ -z "$ENV_FILE" && -f "$OUTPUT_DIR/.env.local" ]]; then
+  ENV_FILE="$OUTPUT_DIR/.env.local"
+fi
+
+if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
+  print_header "Step 5.5: Processing Environment Variables"
+
+  log_info "Reading environment file: $ENV_FILE"
+  echo ""
+  echo "┌────────────────────────────────────────────────────────────────────┐"
+  echo "│  Annotation syntax:                                                │"
+  echo "│    # @secret    → Store in GCP Secret Manager                      │"
+  echo "│    # @public    → Store as plain env var (default)                 │"
+  echo "│    (no marker)  → Treated as @public                               │"
+  echo "└────────────────────────────────────────────────────────────────────┘"
+  echo ""
+
+  declare -A ENV_MAP
+  declare -A SECRET_MAP
+  next_is_secret=false
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Skip empty lines
+    [[ -z "$line" ]] && continue
+
+    # Check for @secret or @public markers
+    if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*@secret ]]; then
+      next_is_secret=true
+      continue
+    elif [[ "$line" =~ ^[[:space:]]*#[[:space:]]*@public ]]; then
+      next_is_secret=false
+      continue
+    fi
+
+    # Skip other comments
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+    # Parse KEY=VALUE
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+
+      # Remove surrounding quotes if present
+      value="${value#\"}"
+      value="${value%\"}"
+      value="${value#\'}"
+      value="${value%\'}"
+
+      # Classify based on marker
+      if [[ "$next_is_secret" == "true" ]]; then
+        SECRET_MAP["$key"]="$value"
+        log_info "  [SECRET] $key"
+      else
+        ENV_MAP["$key"]="$value"
+        log_info "  [ENV] $key"
+      fi
+
+      # Reset marker for next variable
+      next_is_secret=false
+    fi
+  done < "$ENV_FILE"
+
+  # Show summary and ask for confirmation
+  echo ""
+  echo "Summary:"
+  echo "  Public env vars:  ${#ENV_MAP[@]}"
+  echo "  Secret env vars:  ${#SECRET_MAP[@]}"
+  echo ""
+
+  if [[ ${#SECRET_MAP[@]} -gt 0 ]]; then
+    read -p "Continue with this classification? (y/n) " -n 1 -r < /dev/tty
+    echo ""
+
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      log_warn "Aborted. Please update your .env file with @secret/@public markers and try again."
+      exit 1
+    fi
+  fi
+
+  # Create secrets in GCP Secret Manager
+  if [[ ${#SECRET_MAP[@]} -gt 0 ]]; then
+    log_info "Creating secrets in GCP Secret Manager..."
+
+    for key in "${!SECRET_MAP[@]}"; do
+      secret_name=$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+
+      # Check if secret exists
+      if gcloud secrets describe "$secret_name" &>/dev/null; then
+        log_warn "Secret $secret_name already exists, adding new version..."
+        echo -n "${SECRET_MAP[$key]}" | gcloud secrets versions add "$secret_name" --data-file=-
+      else
+        log_info "Creating secret: $secret_name"
+        echo -n "${SECRET_MAP[$key]}" | gcloud secrets create "$secret_name" --data-file=- --replication-policy="automatic"
+      fi
+
+      # Build terraform secret_env_vars
+      SECRET_ENV_VARS_TF+="  $key = \"$secret_name\"\n"
+    done
+
+    log_success "Secrets created in Secret Manager"
+  fi
+
+  # Build terraform env_vars
+  ENV_VARS_TF="  NODE_ENV = \"production\"\n"
+  for key in "${!ENV_MAP[@]}"; do
+    # Escape special characters for terraform
+    escaped_value=$(echo "${ENV_MAP[$key]}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    ENV_VARS_TF+="  $key = \"$escaped_value\"\n"
+  done
+
+  log_success "Environment variables processed"
+else
+  ENV_VARS_TF="  NODE_ENV = \"production\""
+  log_info "No env file found, using defaults"
+fi
+
 # Create directory structure
 print_header "Step 6: Creating Project Structure"
 
@@ -320,10 +446,14 @@ cloud_run_min_instances = 0
 cloud_run_max_instances = 2
 
 env_vars = {
-  NODE_ENV = "production"
+$(echo -e "$ENV_VARS_TF")
 }
 
-secret_env_vars = {}
+secret_env_vars = {
+$(echo -e "$SECRET_ENV_VARS_TF")
+}
+
+custom_domain = "${CUSTOM_DOMAIN:-}"
 EOF
 log_success "Created infra/gcp/terraform.tfvars"
 
@@ -817,6 +947,52 @@ if [[ -z "$WIP" ]] || ! command -v gh &> /dev/null; then
   echo "│ (Copy contents of infra/gcp/terraform.tfvars)                      │"
   echo "│                                                                    │"
   echo "└────────────────────────────────────────────────────────────────────┘"
+fi
+
+# Custom domain configuration
+if [[ -n "$CUSTOM_DOMAIN" ]]; then
+  print_header "Step 10: Custom Domain Configuration"
+
+  # Extract root domain for verification
+  ROOT_DOMAIN=$(echo "$CUSTOM_DOMAIN" | awk -F. '{if (NF>2) print $(NF-1)"."$NF; else print $0}')
+
+  echo "Custom domain: $CUSTOM_DOMAIN"
+  echo ""
+  log_info "Domain verification required before Cloud Run can use custom domains."
+  echo ""
+  echo "┌────────────────────────────────────────────────────────────────────┐"
+  echo "│  Step 1: Verify Domain Ownership                                   │"
+  echo "├────────────────────────────────────────────────────────────────────┤"
+  echo "│                                                                    │"
+  echo "│  Open Google Search Console to verify your domain:                 │"
+  echo "│                                                                    │"
+  echo "│  https://search.google.com/search-console/welcome                  │"
+  echo "│                                                                    │"
+  echo "│  1. Click 'Add property'                                           │"
+  echo "│  2. Select 'URL prefix' and enter: https://$ROOT_DOMAIN            │"
+  echo "│  3. Choose verification method (HTML file or DNS TXT recommended)  │"
+  echo "│  4. Complete verification                                          │"
+  echo "│                                                                    │"
+  echo "└────────────────────────────────────────────────────────────────────┘"
+  echo ""
+  echo "┌────────────────────────────────────────────────────────────────────┐"
+  echo "│  Step 2: Configure DNS Records                                     │"
+  echo "├────────────────────────────────────────────────────────────────────┤"
+  echo "│                                                                    │"
+  echo "│  Add this CNAME record in your DNS provider (Cloudflare, etc.):   │"
+  echo "│                                                                    │"
+  echo "│  Type:   CNAME                                                     │"
+  echo "│  Name:   ${CUSTOM_DOMAIN%%.$ROOT_DOMAIN}                                                       │"
+  echo "│  Target: ghs.googlehosted.com                                      │"
+  echo "│  TTL:    Auto or 3600                                              │"
+  echo "│                                                                    │"
+  echo "│  ⚠️  If using Cloudflare, set Proxy status to 'DNS only' (gray)    │"
+  echo "│                                                                    │"
+  echo "└────────────────────────────────────────────────────────────────────┘"
+  echo ""
+  log_warn "Domain mapping will be created by Terraform after verification."
+  log_info "If terraform apply fails with domain error, verify the domain first."
+  echo ""
 fi
 
 print_header "Bootstrap Complete!"
