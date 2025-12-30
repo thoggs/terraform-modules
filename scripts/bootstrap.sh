@@ -687,6 +687,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
   id-token: write
 
 jobs:
