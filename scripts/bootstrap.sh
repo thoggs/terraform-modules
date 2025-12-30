@@ -61,6 +61,14 @@ while [[ $# -gt 0 ]]; do
       SKIP_TERRAFORM=true
       shift
       ;;
+    --custom-domain=*)
+      CUSTOM_DOMAIN="${1#*=}"
+      shift
+      ;;
+    --provider=*)
+      PROVIDER="${1#*=}"
+      shift
+      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
@@ -74,6 +82,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --output-dir=PATH          Output directory for generated files (default: current dir)"
       echo "  --create-project           Create new GCP project"
       echo "  --skip-terraform           Skip terraform init/plan/apply"
+      echo "  --custom-domain=DOMAIN     Custom domain for Cloud Run (e.g., app.example.com)"
+      echo "  --provider=PROVIDER        Cloud provider: gcp (default), aws*, azure* (*coming soon)"
       echo "  --help                     Show this help"
       echo ""
       echo "Example:"
@@ -92,9 +102,22 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Set defaults
+PROVIDER="${PROVIDER:-gcp}"
 REGION="${REGION:-us-central1}"
 TERRAFORM_MODULES_REPO="${TERRAFORM_MODULES_REPO:-thoggs/terraform-modules}"
 OUTPUT_DIR="${OUTPUT_DIR:-.}"
+
+# Validate provider
+if [[ "$PROVIDER" != "gcp" ]]; then
+  if [[ "$PROVIDER" == "aws" ]] || [[ "$PROVIDER" == "azure" ]]; then
+    log_error "Provider '$PROVIDER' is not implemented yet. Only 'gcp' is currently supported."
+    log_info "AWS and Azure support coming soon!"
+    exit 1
+  else
+    log_error "Unknown provider: $PROVIDER. Supported: gcp (aws and azure coming soon)"
+    exit 1
+  fi
+fi
 
 # Validate required arguments
 if [[ -z "$PROJECT_ID" ]]; then
@@ -127,6 +150,7 @@ WORKFLOWS_DIR="$OUTPUT_DIR/.github/workflows"
 print_header "GCP Cloud Run Bootstrap"
 
 echo "Configuration:"
+echo "  Provider:         $PROVIDER"
 echo "  Project ID:       $PROJECT_ID"
 echo "  Region:           $REGION"
 echo "  Service Name:     $SERVICE_NAME"
@@ -134,6 +158,9 @@ echo "  GitHub Repo:      $GITHUB_REPO"
 echo "  Modules Repo:     $TERRAFORM_MODULES_REPO"
 echo "  State Bucket:     $STATE_BUCKET"
 echo "  Output Dir:       $OUTPUT_DIR"
+if [[ -n "$CUSTOM_DOMAIN" ]]; then
+  echo "  Custom Domain:    $CUSTOM_DOMAIN"
+fi
 echo ""
 
 # Check gcloud auth
