@@ -14,39 +14,6 @@ log_success() { echo -e "${GREEN}✓${NC} $1"; }
 log_warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error() { echo -e "${RED}✗${NC} $1"; }
 
-# Cleanup function (only runs with --force-cleanup)
-cleanup_existing_resources() {
-  print_header "Cleaning Up Existing Resources"
-
-  log_info "Deleting Cloud Run service (if exists)..."
-  gcloud run services delete "$SERVICE_NAME" --region="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || true
-
-  log_info "Deleting Artifact Registry (if exists)..."
-  gcloud artifacts repositories delete "$SERVICE_NAME" --location="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || true
-
-  log_info "Deleting secrets (if exist)..."
-  # List and delete all secrets that might have been created
-  for secret in $(gcloud secrets list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null); do
-    gcloud secrets delete "$secret" --project="$PROJECT_ID" --quiet 2>/dev/null || true
-  done
-
-  log_info "Deleting service accounts (if exist)..."
-  gcloud iam service-accounts delete "${SERVICE_NAME}-run@${PROJECT_ID}.iam.gserviceaccount.com" --project="$PROJECT_ID" --quiet 2>/dev/null || true
-  gcloud iam service-accounts delete "github-actions@${PROJECT_ID}.iam.gserviceaccount.com" --project="$PROJECT_ID" --quiet 2>/dev/null || true
-
-  log_info "Deleting Workload Identity Pool (if exists)..."
-  gcloud iam workload-identity-pools delete github-pool --location=global --project="$PROJECT_ID" --quiet 2>/dev/null || true
-
-  log_info "Clearing Terraform state bucket (if exists)..."
-  gcloud storage rm -r "gs://${PROJECT_ID}-tfstate/**" 2>/dev/null || true
-
-  log_info "Removing local infra and workflow files..."
-  rm -rf "$OUTPUT_DIR/infra" "$OUTPUT_DIR/.github/workflows" 2>/dev/null || true
-
-  log_success "Cleanup complete!"
-  echo ""
-}
-
 print_header() {
   echo ""
   echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
@@ -106,10 +73,6 @@ while [[ $# -gt 0 ]]; do
       ENV_FILE="${1#*=}"
       shift
       ;;
-    --force-cleanup)
-      FORCE_CLEANUP=true
-      shift
-      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
@@ -126,7 +89,6 @@ while [[ $# -gt 0 ]]; do
       echo "  --custom-domain=DOMAIN     Custom domain for Cloud Run (e.g., app.example.com)"
       echo "  --provider=PROVIDER        Cloud provider: gcp (default), aws*, azure* (*coming soon)"
       echo "  --env-file=PATH            Environment file to process (auto-detects .env.local)"
-      echo "  --force-cleanup            Delete ALL existing resources before running (DESTRUCTIVE)"
       echo "  --help                     Show this help"
       echo ""
       echo "Example:"
@@ -204,9 +166,6 @@ echo "  Output Dir:       $OUTPUT_DIR"
 if [[ -n "$CUSTOM_DOMAIN" ]]; then
   echo "  Custom Domain:    $CUSTOM_DOMAIN"
 fi
-if [[ "$FORCE_CLEANUP" == "true" ]]; then
-  echo "  Force Cleanup:    YES (will delete existing resources!)"
-fi
 echo ""
 
 # Check gcloud auth
@@ -253,11 +212,6 @@ fi
 # Set project and quota project
 gcloud config set project "$PROJECT_ID"
 gcloud auth application-default set-quota-project "$PROJECT_ID" --quiet 2>/dev/null || true
-
-# Run cleanup only if --force-cleanup is set
-if [[ "$FORCE_CLEANUP" == "true" ]]; then
-  cleanup_existing_resources
-fi
 
 # Enable APIs
 print_header "Step 3: Enabling APIs"
@@ -556,12 +510,6 @@ module "artifact_registry" {
   description   = "Docker repository for \${var.service_name}"
 }
 
-module "secrets" {
-  source = "github.com/$TERRAFORM_MODULES_REPO//modules/gcp/secrets?ref=main"
-
-  secrets = var.secret_env_vars
-}
-
 module "cloud_run" {
   source = "github.com/$TERRAFORM_MODULES_REPO//modules/gcp/cloud-run?ref=main"
 
@@ -578,8 +526,8 @@ module "cloud_run" {
   env_vars = var.env_vars
 
   secret_env_vars = {
-    for name, _ in var.secret_env_vars : name => {
-      secret_id = module.secrets.secret_ids[name]
+    for name, secret_name in var.secret_env_vars : name => {
+      secret_id = secret_name
       version   = "latest"
     }
   }
@@ -588,7 +536,7 @@ module "cloud_run" {
   allow_public_access = var.allow_public_access
   deletion_protection = var.deletion_protection
 
-  depends_on = [module.artifact_registry, module.secrets]
+  depends_on = [module.artifact_registry]
 }
 EOF
 log_success "Created infra/gcp/main.tf"
