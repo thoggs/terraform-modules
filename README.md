@@ -1,6 +1,27 @@
 # Terraform Modules
 
-Reusable Terraform modules for multi-cloud infrastructure.
+Reusable Terraform modules for multi-cloud infrastructure with automated bootstrap.
+
+## Quick Start (One Command)
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/thoggs/terraform-modules/main/scripts/bootstrap.sh" | bash -s -- \
+  --project-id=my-project \
+  --service-name=my-app \
+  --github-repo=myuser/my-app \
+  --output-dir=/path/to/my-app
+```
+
+This single command will:
+1. Enable required GCP APIs
+2. Create Terraform state bucket
+3. Create Artifact Registry
+4. Build and push Docker image
+5. Process environment variables (secrets → GCP Secret Manager)
+6. Generate Terraform configuration
+7. Generate GitHub Actions CI/CD workflows
+8. Run Terraform to provision infrastructure
+9. Configure GitHub repository secrets
 
 ## Structure
 
@@ -10,19 +31,18 @@ terraform-modules/
 │   ├── gcp/
 │   │   ├── cloud-run/          # Google Cloud Run service
 │   │   ├── workload-identity/  # GitHub Actions OIDC authentication
-│   │   ├── artifact-registry/  # Docker container registry
-│   │   └── secrets/            # Secret Manager secrets
-│   ├── aws/                    # (future)
-│   └── azure/                  # (future)
-├── examples/
-│   └── gcp-cloud-run-complete/ # Full example with all GCP modules
+│   │   └── artifact-registry/  # Docker container registry
+│   ├── aws/                    # (coming soon)
+│   └── azure/                  # (coming soon)
 └── scripts/
-    └── bootstrap.sh            # Initial setup script
+    └── bootstrap.sh            # Automated setup script
 ```
 
-## Quick Start
+---
 
-### 1. Prerequisites
+## Bootstrap Script
+
+### Prerequisites
 
 ```bash
 # Install gcloud CLI
@@ -31,67 +51,155 @@ terraform-modules/
 # Authenticate
 gcloud auth login
 gcloud auth application-default login
+
+# Install GitHub CLI (optional, for auto-configuring secrets)
+# https://cli.github.com
 ```
 
-### 2. Create GCP Project (Console)
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com)
-2. Create new project
-3. Link billing account
-4. Note the Project ID
-
-### 3. Bootstrap Infrastructure
+### Usage
 
 ```bash
-# Clone this repo
-git clone https://github.com/YOUR_USERNAME/terraform-modules.git
-cd terraform-modules
-
-# Run bootstrap script
-./scripts/bootstrap.sh \
-  --project-id="your-project-id" \
-  --region="us-central1" \
-  --service-name="your-service" \
-  --github-repo="owner/repo"
+curl -fsSL "https://raw.githubusercontent.com/thoggs/terraform-modules/main/scripts/bootstrap.sh" | bash -s -- [options]
 ```
 
-### 4. Configure GitHub Secrets
+### Options
 
-After bootstrap, copy the outputs to your GitHub repository secrets:
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--project-id=ID` | GCP Project ID | required |
+| `--service-name=NAME` | Service name | required |
+| `--github-repo=REPO` | GitHub repo (owner/repo) | required |
+| `--region=REGION` | GCP Region | `us-central1` |
+| `--output-dir=PATH` | Output directory for generated files | current dir |
+| `--env-file=PATH` | Environment file to process | auto-detects `.env.local` |
+| `--custom-domain=DOMAIN` | Custom domain for Cloud Run | none |
+| `--create-project` | Create new GCP project | false |
+| `--billing-account=ID` | Billing account (required with --create-project) | none |
+| `--skip-terraform` | Skip terraform execution | false |
+| `--provider=PROVIDER` | Cloud provider: `gcp`, `aws*`, `azure*` (*coming soon) | `gcp` |
 
-| Secret Name                      | Value                                         |
-|----------------------------------|-----------------------------------------------|
-| `GCP_WORKLOAD_IDENTITY_PROVIDER` | `terraform output workload_identity_provider` |
-| `GCP_SERVICE_ACCOUNT_EMAIL`      | `terraform output service_account_email`      |
-| `TERRAFORM_TFVARS`               | Contents of your `terraform.tfvars` file      |
+### Example with All Options
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/thoggs/terraform-modules/main/scripts/bootstrap.sh" | bash -s -- \
+  --project-id=my-gcp-project \
+  --service-name=my-app \
+  --github-repo=myuser/my-app \
+  --region=us-central1 \
+  --output-dir=/path/to/my-app \
+  --env-file=/path/to/my-app/.env.local \
+  --custom-domain=app.example.com
+```
 
 ---
 
-## Module Usage
+## Environment Variables
 
-### Using in Your Project
+The bootstrap script processes `.env.local` files and classifies variables as **public** (plain env vars) or **secret** (stored in GCP Secret Manager).
 
-```hcl
-# your-project/infra/main.tf
+### Annotation Syntax
 
-module "cloud_run" {
-  source = "github.com/YOUR_USERNAME/terraform-modules//modules/gcp/cloud-run?ref=v1.0.0"
+```bash
+# .env.local
 
-  project_id   = "your-project-id"
-  region       = "us-central1"
-  service_name = "your-service"
-  image        = "us-central1-docker.pkg.dev/your-project/your-service/your-service:latest"
+# Regular env vars (default - stored as plain env vars in Cloud Run)
+NODE_ENV=production
+API_URL=https://api.example.com
 
-  cpu           = "1"
-  memory        = "512Mi"
-  min_instances = 1
-  max_instances = 10
+# @secret
+# Variables marked with @secret are stored in GCP Secret Manager
+DATABASE_PASSWORD=super-secret-password
 
-  env_vars = {
-    NODE_ENV = "production"
-  }
+# @public
+# Explicitly mark as public (optional, this is the default)
+PUBLIC_KEY=some-public-value
+```
+
+### How It Works
+
+1. Variables marked with `# @secret` are:
+   - Created in GCP Secret Manager (name converted to lowercase-kebab-case)
+   - Referenced by Cloud Run as secret environment variables
+   - Never exposed in terraform.tfvars
+
+2. All other variables are:
+   - Stored as plain environment variables in Cloud Run
+   - Visible in terraform.tfvars
+
+---
+
+## Health Check Endpoint
+
+Cloud Run requires a health check endpoint. Add this to your Next.js app:
+
+```typescript
+// src/app/api/health/route.ts
+import { NextResponse } from 'next/server'
+
+export async function GET() {
+  return NextResponse.json({ status: 'ok' }, { status: 200 })
 }
 ```
+
+The default health check path is `/api/health`. This can be configured via the `health_check_path` variable in the cloud-run module.
+
+---
+
+## Generated Files
+
+After running bootstrap, these files are created:
+
+```
+your-project/
+├── infra/
+│   └── gcp/
+│       ├── main.tf              # Terraform configuration
+│       ├── variables.tf         # Variable definitions
+│       ├── outputs.tf           # Output definitions
+│       ├── terraform.tfvars     # Variable values (gitignored)
+│       ├── terraform.tfvars.example
+│       └── .gitignore
+└── .github/
+    └── workflows/
+        ├── ci.yml               # PR validation (terraform plan, build)
+        └── cd.yml               # Deploy on push to main
+```
+
+---
+
+## GitHub Secrets
+
+The bootstrap configures these secrets automatically (if GitHub CLI is installed):
+
+| Secret | Description |
+|--------|-------------|
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | Workload Identity provider for OIDC auth |
+| `GCP_SERVICE_ACCOUNT_EMAIL` | Service account for GitHub Actions |
+| `TERRAFORM_TFVARS` | Terraform variables (includes secrets mapping) |
+
+---
+
+## Custom Domain
+
+When using `--custom-domain`, you need to:
+
+### 1. Verify Domain Ownership
+
+Go to [Google Search Console](https://search.google.com/search-console/welcome):
+1. Click "Add property"
+2. Select "URL prefix"
+3. Enter your root domain (e.g., `https://example.com`)
+4. Complete DNS or HTML verification
+
+### 2. Configure DNS
+
+Add a CNAME record in your DNS provider:
+
+| Type | Name | Target |
+|------|------|--------|
+| CNAME | `app` (subdomain) | `ghs.googlehosted.com` |
+
+**Note:** If using Cloudflare, set proxy status to "DNS only" (gray cloud).
 
 ---
 
@@ -99,163 +207,105 @@ module "cloud_run" {
 
 ### cloud-run
 
-Deploys a Cloud Run service with:
+Deploys a Cloud Run service with service account, health checks, autoscaling, and optional custom domain.
 
-- Service account
-- Public access (optional)
-- Custom domain (optional)
-- Health checks (startup + liveness probes)
-- Autoscaling configuration
+```hcl
+module "cloud_run" {
+  source = "github.com/thoggs/terraform-modules//modules/gcp/cloud-run?ref=main"
 
-**Variables:**
+  project_id   = "my-project"
+  region       = "us-central1"
+  service_name = "my-app"
+  image        = "us-central1-docker.pkg.dev/my-project/my-app/my-app:latest"
 
-| Name                  | Description                       | Default       |
-|-----------------------|-----------------------------------|---------------|
-| `project_id`          | GCP Project ID                    | required      |
-| `region`              | GCP Region                        | `us-central1` |
-| `service_name`        | Service name                      | required      |
-| `image`               | Container image URL               | required      |
-| `cpu`                 | CPU limit                         | `1`           |
-| `memory`              | Memory limit                      | `512Mi`       |
-| `min_instances`       | Min instances (0 = scale to zero) | `0`           |
-| `max_instances`       | Max instances                     | `10`          |
-| `cpu_idle`            | CPU idle billing                  | `true`        |
-| `env_vars`            | Environment variables             | `{}`          |
-| `secret_env_vars`     | Secret env vars                   | `{}`          |
-| `allow_public_access` | Allow unauthenticated access      | `true`        |
-| `custom_domain`       | Custom domain                     | `""`          |
+  env_vars = {
+    NODE_ENV = "production"
+  }
 
-**Outputs:**
+  secret_env_vars = {
+    DATABASE_PASSWORD = {
+      secret_id = "database-password"
+      version   = "latest"
+    }
+  }
 
-| Name                    | Description           |
-|-------------------------|-----------------------|
-| `url`                   | Cloud Run service URL |
-| `service_account_email` | Service account email |
+  custom_domain       = "app.example.com"
+  allow_public_access = true
+}
+```
 
----
+**Key Variables:**
+
+| Name | Description | Default |
+|------|-------------|---------|
+| `cpu` | CPU limit | `1` |
+| `memory` | Memory limit | `512Mi` |
+| `min_instances` | Min instances (0 = scale to zero) | `0` |
+| `max_instances` | Max instances | `10` |
+| `health_check_path` | Health check endpoint | `/api/health` |
+| `deletion_protection` | Prevent accidental deletion | `false` |
 
 ### workload-identity
 
-Sets up Workload Identity Federation for GitHub Actions:
+Sets up Workload Identity Federation for GitHub Actions (no service account keys needed).
 
-- Identity Pool
-- OIDC Provider
-- Service Account with IAM roles
+```hcl
+module "workload_identity" {
+  source = "github.com/thoggs/terraform-modules//modules/gcp/workload-identity?ref=main"
 
-**Variables:**
-
-| Name                 | Description              | Default          |
-|----------------------|--------------------------|------------------|
-| `project_id`         | GCP Project ID           | required         |
-| `github_repo`        | GitHub repo (owner/repo) | required         |
-| `pool_id`            | Pool ID                  | `github-pool`    |
-| `service_account_id` | SA ID                    | `github-actions` |
-
-**Outputs:**
-
-| Name                         | Description                      |
-|------------------------------|----------------------------------|
-| `workload_identity_provider` | Provider name for GitHub Actions |
-| `service_account_email`      | Service account email            |
-
----
+  project_id  = "my-project"
+  github_repo = "myuser/my-repo"
+}
+```
 
 ### artifact-registry
 
 Creates a Docker repository with cleanup policies.
 
-**Variables:**
-
-| Name                | Description            | Default       |
-|---------------------|------------------------|---------------|
-| `region`            | GCP Region             | `us-central1` |
-| `repository_id`     | Repository ID          | required      |
-| `delete_untagged`   | Delete untagged images | `true`        |
-| `keep_recent_count` | Images to keep         | `2`           |
-
-**Outputs:**
-
-| Name             | Description              |
-|------------------|--------------------------|
-| `repository_url` | URL for docker push/pull |
-
----
-
-### secrets
-
-Manages Secret Manager secrets.
-
-**Variables:**
-
-| Name      | Description                   | Default |
-|-----------|-------------------------------|---------|
-| `secrets` | Map of secret names to values | `{}`    |
-
-**Outputs:**
-
-| Name         | Description                |
-|--------------|----------------------------|
-| `secret_ids` | Map of secret names to IDs |
-
----
-
-## Versioning
-
-This repository follows [Semantic Versioning](https://semver.org/):
-
-- `v1.0.0` - Initial stable release
-- `v1.1.0` - New features (backwards compatible)
-- `v2.0.0` - Breaking changes
-
-Pin your module versions:
-
 ```hcl
-source = "github.com/USER/terraform-modules//modules/gcp/cloud-run?ref=v1.0.0"
+module "artifact_registry" {
+  source = "github.com/thoggs/terraform-modules//modules/gcp/artifact-registry?ref=main"
+
+  region        = "us-central1"
+  repository_id = "my-app"
+}
 ```
 
 ---
 
-## GitHub Actions Workflow
+## Re-running Bootstrap
 
-Example workflow for your project:
+The bootstrap is **idempotent** - safe to run multiple times:
 
-```yaml
-name: Deploy to Cloud Run
+- Existing resources are detected and skipped
+- Secrets get new versions (not duplicated)
+- Terraform state is preserved
+- Generated files are overwritten
 
-on:
-  push:
-    branches: [ main ]
+---
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
+## Troubleshooting
 
-    steps:
-      - uses: actions/checkout@v4
+### "Workload Identity Pool already exists"
 
-      - uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
-
-      - name: Configure Docker
-        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
-
-      - name: Build and Push
-        uses: docker/build-push-action@v6
-        with:
-          push: true
-          tags: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT }}/${{ env.SERVICE }}/${{ env.SERVICE }}:${{ github.sha }}
-
-      - name: Terraform Apply
-        working-directory: infra
-        run: |
-          terraform init
-          terraform apply -auto-approve -var="image_tag=${{ github.sha }}"
+The pool may be in soft-delete state (30 days). Run:
+```bash
+gcloud iam workload-identity-pools undelete github-pool --location=global --project=PROJECT_ID
 ```
+
+### "Permission denied on secret"
+
+Grant access to the Cloud Run service account:
+```bash
+gcloud secrets add-iam-policy-binding SECRET_NAME \
+  --project=PROJECT_ID \
+  --member="serviceAccount:SERVICE_NAME-run@PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+### Container startup failed
+
+Ensure your app has a `/api/health` endpoint that returns HTTP 200.
 
 ---
 
