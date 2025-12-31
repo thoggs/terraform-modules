@@ -38,3 +38,9 @@ variable "keep_recent_count" {
   type        = number
   default     = 2
 }
+
+variable "delete_older_than_days" {
+  description = "Delete tagged images older than N days (0 to disable)"
+  type        = number
+  default     = 1
+}
