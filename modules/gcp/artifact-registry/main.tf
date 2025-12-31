@@ -29,4 +29,17 @@ resource "google_artifact_registry_repository" "main" {
       }
     }
   }
+
+  dynamic "cleanup_policies" {
+    for_each = var.delete_older_than_days > 0 ? [1] : []
+    content {
+      id     = "delete-old-tagged"
+      action = "DELETE"
+
+      condition {
+        tag_state  = "TAGGED"
+        older_than = "${var.delete_older_than_days * 24 * 60 * 60}s"
+      }
+    }
+  }
 }
