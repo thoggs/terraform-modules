@@ -961,27 +961,27 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
-          workload_identity_provider: \\\${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: \\\${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+          workload_identity_provider: \${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure Docker
-        run: gcloud auth configure-docker \\\${{ env.REGION }}-docker.pkg.dev --quiet
+        run: gcloud auth configure-docker \${{ env.REGION }}-docker.pkg.dev --quiet
 "
 
 # Common footer for all project types
 CD_FOOTER="
       - name: Build Docker image
         run: |
-          docker build -t \\\${{ env.REGION }}-docker.pkg.dev/\\\${{ env.PROJECT_ID }}/\\\${{ env.SERVICE_NAME }}/\\\${{ env.SERVICE_NAME }}:\\\${{ github.sha }} .
-          docker tag \\\${{ env.REGION }}-docker.pkg.dev/\\\${{ env.PROJECT_ID }}/\\\${{ env.SERVICE_NAME }}/\\\${{ env.SERVICE_NAME }}:\\\${{ github.sha }} \\\${{ env.REGION }}-docker.pkg.dev/\\\${{ env.PROJECT_ID }}/\\\${{ env.SERVICE_NAME }}/\\\${{ env.SERVICE_NAME }}:latest
+          docker build -t \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} .
+          docker tag \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
 
       - name: Push Docker image
         run: |
-          docker push \\\${{ env.REGION }}-docker.pkg.dev/\\\${{ env.PROJECT_ID }}/\\\${{ env.SERVICE_NAME }}/\\\${{ env.SERVICE_NAME }}:\\\${{ github.sha }}
-          docker push \\\${{ env.REGION }}-docker.pkg.dev/\\\${{ env.PROJECT_ID }}/\\\${{ env.SERVICE_NAME }}/\\\${{ env.SERVICE_NAME }}:latest
+          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
+          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -994,7 +994,7 @@ CD_FOOTER="
 
       - name: Terraform Apply
         working-directory: infra/gcp
-        run: terraform apply -var-file=terraform.tfvars -var=\"image_tag=\\\${{ github.sha }}\" -auto-approve -input=false"
+        run: terraform apply -var-file=terraform.tfvars -var=\"image_tag=\${{ github.sha }}\" -auto-approve -input=false"
 
 case "$PROJECT_TYPE" in
   nodejs)
