@@ -141,3 +141,9 @@ variable "custom_domain" {
   type        = string
   default     = ""
 }
+
+variable "domain_force_override" {
+  description = "Force override domain mapping if already exists in another project"
+  type        = bool
+  default     = true
+}
