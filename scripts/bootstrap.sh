@@ -1087,8 +1087,14 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
 
   cd "$INFRA_DIR"
 
+  # Clean up old terraform cache to avoid backend conflicts
+  if [[ -d ".terraform" ]]; then
+    log_info "Cleaning up old terraform cache..."
+    rm -rf .terraform
+  fi
+
   log_info "Terraform init..."
-  terraform init -reconfigure
+  terraform init
 
   log_info "Terraform plan..."
   terraform plan -var-file=terraform.tfvars -out=tfplan
