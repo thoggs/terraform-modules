@@ -787,7 +787,7 @@ jobs:
 EOF
 log_success "Created .github/workflows/ci-terraform.yml"
 
-# Create CD workflow (build & deploy)
+# Create CD workflow (build & deploy with Terraform)
 cat > "$WORKFLOWS_DIR/cd.yml" << EOF
 name: CD
 
@@ -797,7 +797,6 @@ on:
       - main
     paths-ignore:
       - '*.md'
-      - 'infra/**'
 
 permissions:
   contents: read
@@ -857,130 +856,26 @@ jobs:
           docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
           docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
 
-      - name: Deploy to Cloud Run
-        run: |
-          gcloud run services update \${{ env.SERVICE_NAME }} \\
-            --region=\${{ env.REGION }} \\
-            --image=\${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
-EOF
-log_success "Created .github/workflows/cd.yml"
-
-# Create CD Terraform workflow
-cat > "$WORKFLOWS_DIR/cd-terraform.yml" << EOF
-name: CD Terraform
-
-on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - '*.md'
-
-permissions:
-  contents: read
-  id-token: write
-
-env:
-  REGION: $REGION
-  SERVICE_NAME: $SERVICE_NAME
-  PROJECT_ID: $PROJECT_ID
-
-jobs:
-  deploy:
-    name: Build & Deploy (Terraform)
-    runs-on: ubuntu-latest
-    environment: Production
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 2
-
-      - name: Check for infra changes
-        uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            infra:
-              - 'infra/**'
-
-      - name: Authenticate to Google Cloud
-        if: steps.filter.outputs.infra == 'true'
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: \${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
-
-      - name: Set up Cloud SDK
-        if: steps.filter.outputs.infra == 'true'
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Configure Docker
-        if: steps.filter.outputs.infra == 'true'
-        run: gcloud auth configure-docker \${{ env.REGION }}-docker.pkg.dev --quiet
-
-      - name: Enable Corepack
-        if: steps.filter.outputs.infra == 'true'
-        run: corepack enable
-
-      - name: Setup Node.js
-        if: steps.filter.outputs.infra == 'true'
-        uses: actions/setup-node@v6
-        with:
-          node-version: lts/*
-          cache: yarn
-
-      - name: Install dependencies
-        if: steps.filter.outputs.infra == 'true'
-        run: yarn install --immutable
-
-      - name: Build application
-        if: steps.filter.outputs.infra == 'true'
-        run: yarn build
-        env:
-          NODE_ENV: production
-
-      - name: Build Docker image
-        if: steps.filter.outputs.infra == 'true'
-        run: |
-          docker build -t \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} .
-          docker tag \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
-
-      - name: Push Docker image
-        if: steps.filter.outputs.infra == 'true'
-        run: |
-          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
-          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
-
       - name: Create terraform.tfvars
-        if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
         run: |
           echo '\${{ secrets.TERRAFORM_TFVARS }}' > terraform.tfvars
           echo 'image_tag = "\${{ github.sha }}"' >> terraform.tfvars
 
       - name: Setup Terraform
-        if: steps.filter.outputs.infra == 'true'
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.5"
 
       - name: Terraform Init
-        if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
         run: terraform init
 
       - name: Terraform Apply
-        if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
         run: terraform apply -var-file=terraform.tfvars -auto-approve -input=false
-
-      - name: No infra changes
-        if: steps.filter.outputs.infra != 'true'
-        run: echo "No infrastructure changes detected, skipping Terraform"
 EOF
-log_success "Created .github/workflows/cd-terraform.yml"
+log_success "Created .github/workflows/cd.yml"
 
 # Create .gitignore for terraform
 cat > "$INFRA_DIR/.gitignore" << 'EOF'
@@ -1180,10 +1075,9 @@ echo "    ├── terraform.tfvars"
 echo "    ├── terraform.tfvars.example"
 echo "    └── .gitignore"
 echo "  $WORKFLOWS_DIR/"
-echo "    ├── ci.yml              (build - always runs)"
-echo "    ├── ci-terraform.yml    (terraform plan - only on infra changes)"
-echo "    ├── cd.yml              (deploy - only on app changes)"
-echo "    └── cd-terraform.yml    (terraform apply - only on infra changes)"
+echo "    ├── ci.yml              (build - always runs on PR)"
+echo "    ├── ci-terraform.yml    (terraform plan - skips if no infra changes)"
+echo "    └── cd.yml              (build + terraform apply - always runs on push)"
 echo ""
 echo "Next steps:"
 echo "  1. Review generated files"
