@@ -1120,8 +1120,40 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
 
   if [[ $REPLY =~ ^[Yy]$ ]]; then
     log_info "Terraform apply..."
-    terraform apply tfplan
-    log_success "Terraform applied"
+
+    # Retry logic for IAM propagation delays
+    max_retries=3
+    retry_count=0
+    apply_success=false
+
+    while [[ $retry_count -lt $max_retries ]]; do
+      set +e
+      terraform apply tfplan
+      apply_exit_code=$?
+      set -e
+
+      if [[ $apply_exit_code -eq 0 ]]; then
+        apply_success=true
+        break
+      else
+        ((retry_count++))
+        if [[ $retry_count -lt $max_retries ]]; then
+          log_warn "Apply failed (attempt $retry_count/$max_retries). Waiting 30s for IAM propagation..."
+          sleep 30
+          log_info "Retrying terraform apply..."
+          # Regenerate plan for retry
+          terraform plan -var-file=terraform.tfvars -out=tfplan
+        fi
+      fi
+    done
+
+    if [[ "$apply_success" == "true" ]]; then
+      log_success "Terraform applied"
+    else
+      log_error "Terraform apply failed after $max_retries attempts"
+      log_info "Try running manually: cd $INFRA_DIR && terraform apply -var-file=terraform.tfvars"
+      exit 1
+    fi
 
     # Get outputs for GitHub secrets
     WIP=$(terraform output -raw workload_identity_provider 2>/dev/null || echo "")
