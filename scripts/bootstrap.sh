@@ -1099,11 +1099,16 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
   # Import existing resources created by bootstrap
   log_info "Importing existing resources into Terraform state..."
 
-  # Import Artifact Registry if it exists
+  # Import Artifact Registry if it exists and not already in state
   if gcloud artifacts repositories describe "$SERVICE_NAME" --location="$REGION" &>/dev/null; then
-    terraform import -var-file=terraform.tfvars \
-      "module.artifact_registry.google_artifact_registry_repository.main" \
-      "projects/$PROJECT_ID/locations/$REGION/repositories/$SERVICE_NAME" 2>/dev/null || true
+    if ! terraform state show "module.artifact_registry.google_artifact_registry_repository.main" &>/dev/null; then
+      log_info "Importing existing Artifact Registry: $SERVICE_NAME"
+      terraform import -var-file=terraform.tfvars \
+        "module.artifact_registry.google_artifact_registry_repository.main" \
+        "projects/$PROJECT_ID/locations/$REGION/repositories/$SERVICE_NAME"
+    else
+      log_success "Artifact Registry already in Terraform state"
+    fi
   fi
 
   log_info "Terraform plan..."
