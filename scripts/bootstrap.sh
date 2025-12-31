@@ -1128,21 +1128,29 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
 
     while [[ $retry_count -lt $max_retries ]]; do
       set +e
-      terraform apply tfplan
+      apply_output=$(terraform apply tfplan 2>&1)
       apply_exit_code=$?
       set -e
+
+      echo "$apply_output"
 
       if [[ $apply_exit_code -eq 0 ]]; then
         apply_success=true
         break
       else
-        ((retry_count++))
-        if [[ $retry_count -lt $max_retries ]]; then
-          log_warn "Apply failed (attempt $retry_count/$max_retries). Waiting 30s for IAM propagation..."
-          sleep 30
-          log_info "Retrying terraform apply..."
-          # Regenerate plan for retry
-          terraform plan -var-file=terraform.tfvars -out=tfplan
+        # Only retry on IAM/permission errors
+        if echo "$apply_output" | grep -qiE "(permission denied|iam|secretAccessor|403|access denied)"; then
+          ((retry_count++))
+          if [[ $retry_count -lt $max_retries ]]; then
+            log_warn "IAM permission error detected (attempt $retry_count/$max_retries). Waiting 30s for propagation..."
+            sleep 30
+            log_info "Retrying terraform apply..."
+            terraform plan -var-file=terraform.tfvars -out=tfplan
+          fi
+        else
+          # Non-IAM error, don't retry
+          log_error "Terraform apply failed with non-retryable error"
+          exit 1
         fi
       fi
     done
