@@ -1088,7 +1088,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
   cd "$INFRA_DIR"
 
   log_info "Terraform init..."
-  terraform init
+  terraform init -reconfigure
 
   log_info "Terraform plan..."
   terraform plan -var-file=terraform.tfvars -out=tfplan
