@@ -758,6 +758,14 @@ jobs:
           node-version: lts/*
           cache: yarn
 
+      - name: Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('yarn.lock') }}-${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('yarn.lock') }}-
+
       - name: Install dependencies
         run: yarn install --immutable
 
@@ -1007,6 +1015,14 @@ case "$PROJECT_TYPE" in
         with:
           node-version: lts/*
           cache: yarn
+
+      - name: Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: \${{ github.workspace }}/.next/cache
+          key: \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-\${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx') }}
+          restore-keys: |
+            \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-
 
       - name: Install dependencies
         run: yarn install --immutable
