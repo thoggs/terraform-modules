@@ -965,7 +965,7 @@ jobs:
           service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
       - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Configure Docker
         run: gcloud auth configure-docker \${{ env.REGION }}-docker.pkg.dev --quiet
