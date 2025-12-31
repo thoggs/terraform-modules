@@ -73,6 +73,10 @@ while [[ $# -gt 0 ]]; do
       ENV_FILE="${1#*=}"
       shift
       ;;
+    --project-type=*)
+      PROJECT_TYPE="${1#*=}"
+      shift
+      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
@@ -89,13 +93,21 @@ while [[ $# -gt 0 ]]; do
       echo "  --custom-domain=DOMAIN     Custom domain for Cloud Run (e.g., app.example.com)"
       echo "  --provider=PROVIDER        Cloud provider: gcp (default), aws*, azure* (*coming soon)"
       echo "  --env-file=PATH            Environment file to process (auto-detects .env.local)"
+      echo "  --project-type=TYPE        Project type (required): nodejs, java-maven, java-gradle, docker-only"
       echo "  --help                     Show this help"
+      echo ""
+      echo "Project types:"
+      echo "  nodejs       - Node.js project (yarn/npm build before Docker)"
+      echo "  java-maven   - Java project with Maven (mvn package before Docker)"
+      echo "  java-gradle  - Java project with Gradle (./gradlew build before Docker)"
+      echo "  docker-only  - Multi-stage Dockerfile handles everything"
       echo ""
       echo "Example:"
       echo "  ./bootstrap.sh \\"
       echo "    --project-id=my-project \\"
       echo "    --service-name=my-app \\"
       echo "    --github-repo=myuser/my-app \\"
+      echo "    --project-type=nodejs \\"
       echo "    --output-dir=/path/to/my-app"
       exit 0
       ;;
@@ -140,6 +152,22 @@ if [[ -z "$GITHUB_REPO" ]]; then
   exit 1
 fi
 
+if [[ -z "$PROJECT_TYPE" ]]; then
+  log_error "Missing required argument: --project-type"
+  log_info "Options: nodejs, java-maven, java-gradle, docker-only"
+  exit 1
+fi
+
+case "$PROJECT_TYPE" in
+  nodejs|java-maven|java-gradle|docker-only)
+    ;;
+  *)
+    log_error "Invalid project type: $PROJECT_TYPE"
+    log_info "Options: nodejs, java-maven, java-gradle, docker-only"
+    exit 1
+    ;;
+esac
+
 if [[ "$CREATE_PROJECT" == "true" && -z "$BILLING_ACCOUNT" ]]; then
   log_error "Missing required argument: --billing-account (required when using --create-project)"
   exit 1
@@ -163,6 +191,7 @@ echo "  GitHub Repo:      $GITHUB_REPO"
 echo "  Modules Repo:     $TERRAFORM_MODULES_REPO"
 echo "  State Bucket:     $STATE_BUCKET"
 echo "  Output Dir:       $OUTPUT_DIR"
+echo "  Project Type:     $PROJECT_TYPE"
 if [[ -n "$CUSTOM_DOMAIN" ]]; then
   echo "  Custom Domain:    $CUSTOM_DOMAIN"
 fi
@@ -269,22 +298,35 @@ log_success "Docker configured"
 
 # Check if Dockerfile exists in output directory
 if [[ -f "$OUTPUT_DIR/Dockerfile" ]]; then
-  # Check if Node.js build is needed (package.json exists)
-  if [[ -f "$OUTPUT_DIR/package.json" ]]; then
-    log_info "Running application build..."
-    cd "$OUTPUT_DIR"
-
-    if command -v yarn &>/dev/null && [[ -f "yarn.lock" ]]; then
-      yarn install --immutable 2>/dev/null || yarn install
-      yarn build
-    elif command -v npm &>/dev/null; then
-      npm ci 2>/dev/null || npm install
-      npm run build
-    fi
-
-    cd - > /dev/null
-    log_success "Application built"
-  fi
+  # Run build based on project type
+  cd "$OUTPUT_DIR"
+  case "$PROJECT_TYPE" in
+    nodejs)
+      log_info "Building Node.js application..."
+      if command -v yarn &>/dev/null && [[ -f "yarn.lock" ]]; then
+        yarn install --immutable 2>/dev/null || yarn install
+        yarn build
+      elif command -v npm &>/dev/null; then
+        npm ci 2>/dev/null || npm install
+        npm run build
+      fi
+      log_success "Node.js application built"
+      ;;
+    java-maven)
+      log_info "Building Java application with Maven..."
+      mvn package -DskipTests
+      log_success "Maven build completed"
+      ;;
+    java-gradle)
+      log_info "Building Java application with Gradle..."
+      ./gradlew build -x test
+      log_success "Gradle build completed"
+      ;;
+    docker-only)
+      log_info "Skipping application build (docker-only mode)"
+      ;;
+  esac
+  cd - > /dev/null
 
   log_info "Building Docker image (linux/amd64)..."
 
@@ -369,12 +411,10 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
       if [[ "$next_is_secret" == "true" ]]; then
         echo "$key" >> "$SECRET_KEYS_FILE"
         echo "$value" >> "$SECRET_VALUES_FILE"
-        log_info "  [SECRET] $key"
         ((secret_count++))
       else
         echo "$key" >> "$ENV_KEYS_FILE"
         echo "$value" >> "$ENV_VALUES_FILE"
-        log_info "  [ENV] $key"
         ((env_count++))
       fi
 
@@ -383,11 +423,23 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
     fi
   done < "$ENV_FILE"
 
-  # Show summary and ask for confirmation
-  echo ""
-  echo "Summary:"
-  echo "  Public env vars:  $env_count"
-  echo "  Secret env vars:  $secret_count"
+  # Display grouped by type
+  if [[ $secret_count -gt 0 ]]; then
+    echo ""
+    echo -e "${RED}Secrets ($secret_count):${NC}"
+    while IFS= read -r key; do
+      echo "  • $key"
+    done < "$SECRET_KEYS_FILE"
+  fi
+
+  if [[ $env_count -gt 0 ]]; then
+    echo ""
+    echo -e "${GREEN}Environment Variables ($env_count):${NC}"
+    while IFS= read -r key; do
+      echo "  • $key"
+    done < "$ENV_KEYS_FILE"
+  fi
+
   echo ""
 
   if [[ $secret_count -gt 0 ]]; then
@@ -674,7 +726,10 @@ log_success "Terraform files formatted"
 # Create CI workflow (build only)
 print_header "Step 7: Creating GitHub Workflows"
 
-cat > "$WORKFLOWS_DIR/ci.yml" << EOF
+# Generate CI workflow based on project type
+case "$PROJECT_TYPE" in
+  nodejs)
+    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
 name: CI
 
 on:
@@ -711,6 +766,97 @@ jobs:
         env:
           NODE_ENV: production
 EOF
+    ;;
+  java-maven)
+    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths-ignore:
+      - '*.md'
+
+jobs:
+  build:
+    name: Build & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build with Maven
+        run: mvn package -DskipTests
+EOF
+    ;;
+  java-gradle)
+    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths-ignore:
+      - '*.md'
+
+jobs:
+  build:
+    name: Build & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Build with Gradle
+        run: ./gradlew build -x test
+EOF
+    ;;
+  docker-only)
+    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths-ignore:
+      - '*.md'
+
+jobs:
+  build:
+    name: Build & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Build Docker image (validation)
+        run: docker build -t test-build .
+EOF
+    ;;
+esac
 log_success "Created .github/workflows/ci.yml"
 
 # Create CI Terraform workflow
@@ -782,9 +928,9 @@ jobs:
 EOF
 log_success "Created .github/workflows/ci-terraform.yml"
 
-# Create CD workflow (build & deploy with Terraform)
-cat > "$WORKFLOWS_DIR/cd.yml" << EOF
-name: CD
+# Generate CD workflow based on project type
+# Common header for all project types
+CD_HEADER="name: CD
 
 on:
   push:
@@ -815,15 +961,44 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
-          workload_identity_provider: \${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+          workload_identity_provider: \\\${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: \\\${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure Docker
-        run: gcloud auth configure-docker \${{ env.REGION }}-docker.pkg.dev --quiet
+        run: gcloud auth configure-docker \\\${{ env.REGION }}-docker.pkg.dev --quiet
+"
 
+# Common footer for all project types
+CD_FOOTER="
+      - name: Build Docker image
+        run: |
+          docker build -t \\\${{ env.REGION }}-docker.pkg.dev/\\\${{ env.PROJECT_ID }}/\\\${{ env.SERVICE_NAME }}/\\\${{ env.SERVICE_NAME }}:\\\${{ github.sha }} .
+          docker tag \\\${{ env.REGION }}-docker.pkg.dev/\\\${{ env.PROJECT_ID }}/\\\${{ env.SERVICE_NAME }}/\\\${{ env.SERVICE_NAME }}:\\\${{ github.sha }} \\\${{ env.REGION }}-docker.pkg.dev/\\\${{ env.PROJECT_ID }}/\\\${{ env.SERVICE_NAME }}/\\\${{ env.SERVICE_NAME }}:latest
+
+      - name: Push Docker image
+        run: |
+          docker push \\\${{ env.REGION }}-docker.pkg.dev/\\\${{ env.PROJECT_ID }}/\\\${{ env.SERVICE_NAME }}/\\\${{ env.SERVICE_NAME }}:\\\${{ github.sha }}
+          docker push \\\${{ env.REGION }}-docker.pkg.dev/\\\${{ env.PROJECT_ID }}/\\\${{ env.SERVICE_NAME }}/\\\${{ env.SERVICE_NAME }}:latest
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: \"~> 1.5\"
+
+      - name: Terraform Init
+        working-directory: infra/gcp
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: infra/gcp
+        run: terraform apply -var-file=terraform.tfvars -var=\"image_tag=\\\${{ github.sha }}\" -auto-approve -input=false"
+
+case "$PROJECT_TYPE" in
+  nodejs)
+    CD_BUILD_STEPS="
       - name: Enable Corepack
         run: corepack enable
 
@@ -840,30 +1015,40 @@ jobs:
         run: yarn build
         env:
           NODE_ENV: production
-
-      - name: Build Docker image
-        run: |
-          docker build -t \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} .
-          docker tag \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
-
-      - name: Push Docker image
-        run: |
-          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
-          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+"
+    ;;
+  java-maven)
+    CD_BUILD_STEPS="
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
-          terraform_version: "~> 1.5"
+          distribution: temurin
+          java-version: '21'
+          cache: maven
 
-      - name: Terraform Init
-        working-directory: infra/gcp
-        run: terraform init
+      - name: Build with Maven
+        run: mvn package -DskipTests
+"
+    ;;
+  java-gradle)
+    CD_BUILD_STEPS="
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
 
-      - name: Terraform Apply
-        working-directory: infra/gcp
-        run: terraform apply -var-file=terraform.tfvars -var="image_tag=\${{ github.sha }}" -auto-approve -input=false
-EOF
+      - name: Build with Gradle
+        run: ./gradlew build -x test
+"
+    ;;
+  docker-only)
+    CD_BUILD_STEPS=""
+    ;;
+esac
+
+echo -e "${CD_HEADER}${CD_BUILD_STEPS}${CD_FOOTER}" > "$WORKFLOWS_DIR/cd.yml"
 log_success "Created .github/workflows/cd.yml"
 
 # Create .gitignore for terraform
