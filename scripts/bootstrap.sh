@@ -755,10 +755,10 @@ jobs:
           workload_identity_provider: \${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
-      - name: Create terraform.tfvars
+      - name: Set image tag
         if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
-        run: echo '\${{ secrets.TERRAFORM_TFVARS }}' > terraform.tfvars
+        run: echo 'image_tag = "latest"' >> terraform.tfvars
 
       - name: Setup Terraform
         if: steps.filter.outputs.infra == 'true'
@@ -856,11 +856,9 @@ jobs:
           docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
           docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
 
-      - name: Create terraform.tfvars
+      - name: Set image tag
         working-directory: infra/gcp
-        run: |
-          echo '\${{ secrets.TERRAFORM_TFVARS }}' > terraform.tfvars
-          echo 'image_tag = "\${{ github.sha }}"' >> terraform.tfvars
+        run: echo 'image_tag = "\${{ github.sha }}"' >> terraform.tfvars
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -882,8 +880,6 @@ cat > "$INFRA_DIR/.gitignore" << 'EOF'
 .terraform/
 *.tfstate
 *.tfstate.*
-*.tfvars
-!*.tfvars.example
 .terraform.lock.hcl
 tfplan
 EOF
@@ -972,12 +968,6 @@ if command -v gh &> /dev/null; then
         log_success "Set GCP_SERVICE_ACCOUNT_EMAIL"
       fi
 
-      # Set TERRAFORM_TFVARS
-      if [[ -f "$INFRA_DIR/terraform.tfvars" ]]; then
-        gh secret set TERRAFORM_TFVARS --repo="$GITHUB_REPO" --env=Production < "$INFRA_DIR/terraform.tfvars"
-        log_success "Set TERRAFORM_TFVARS"
-      fi
-
       log_success "GitHub secrets configured in 'Production' environment!"
     else
       log_warn "Skipped GitHub secrets configuration"
@@ -1012,8 +1002,7 @@ if [[ -z "$WIP" ]] || ! command -v gh &> /dev/null; then
     echo "│ (run terraform apply first)"
   fi
   echo "│                                                                    │"
-  echo "│ TERRAFORM_TFVARS:                                                  │"
-  echo "│ (Copy contents of infra/gcp/terraform.tfvars)                      │"
+  echo "│ Note: terraform.tfvars is committed to the repo (no secret needed) │"
   echo "│                                                                    │"
   echo "└────────────────────────────────────────────────────────────────────┘"
 fi
