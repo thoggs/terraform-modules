@@ -755,11 +755,6 @@ jobs:
           workload_identity_provider: \${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
-      - name: Set image tag
-        if: steps.filter.outputs.infra == 'true'
-        working-directory: infra/gcp
-        run: echo 'image_tag = "latest"' >> terraform.tfvars
-
       - name: Setup Terraform
         if: steps.filter.outputs.infra == 'true'
         uses: hashicorp/setup-terraform@v3
@@ -779,7 +774,7 @@ jobs:
       - name: Terraform Plan
         if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
-        run: terraform plan -var-file=terraform.tfvars -input=false
+        run: terraform plan -var-file=terraform.tfvars -var="image_tag=latest" -input=false
 
       - name: No infra changes
         if: steps.filter.outputs.infra != 'true'
@@ -856,10 +851,6 @@ jobs:
           docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
           docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
 
-      - name: Set image tag
-        working-directory: infra/gcp
-        run: echo 'image_tag = "\${{ github.sha }}"' >> terraform.tfvars
-
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -871,7 +862,7 @@ jobs:
 
       - name: Terraform Apply
         working-directory: infra/gcp
-        run: terraform apply -var-file=terraform.tfvars -auto-approve -input=false
+        run: terraform apply -var-file=terraform.tfvars -var="image_tag=\${{ github.sha }}" -auto-approve -input=false
 EOF
 log_success "Created .github/workflows/cd.yml"
 
