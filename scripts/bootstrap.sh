@@ -363,9 +363,10 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
   echo ""
   echo "┌────────────────────────────────────────────────────────────────────┐"
   echo "│  Annotation syntax:                                                │"
-  echo "│    # @secret    → Store in GCP Secret Manager                      │"
-  echo "│    # @public    → Store as plain env var (default)                 │"
-  echo "│    (no marker)  → Treated as @public                               │"
+  echo "│    # @secret    → GCP Secret Manager (runtime)                     │"
+  echo "│    # @build     → GitHub Variables (build-time, e.g. NEXT_PUBLIC)  │"
+  echo "│    # @public    → Cloud Run env vars (runtime, default)            │"
+  echo "│    NEXT_PUBLIC_* without tag → auto-detected as @build             │"
   echo "└────────────────────────────────────────────────────────────────────┘"
   echo ""
 
@@ -374,22 +375,28 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
   ENV_VALUES_FILE=$(mktemp)
   SECRET_KEYS_FILE=$(mktemp)
   SECRET_VALUES_FILE=$(mktemp)
-  trap "rm -f $ENV_KEYS_FILE $ENV_VALUES_FILE $SECRET_KEYS_FILE $SECRET_VALUES_FILE" EXIT
+  BUILD_KEYS_FILE=$(mktemp)
+  BUILD_VALUES_FILE=$(mktemp)
+  trap "rm -f $ENV_KEYS_FILE $ENV_VALUES_FILE $SECRET_KEYS_FILE $SECRET_VALUES_FILE $BUILD_KEYS_FILE $BUILD_VALUES_FILE" EXIT
 
-  next_is_secret=false
+  next_marker=""
   env_count=0
   secret_count=0
+  build_count=0
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     # Skip empty lines
     [[ -z "$line" ]] && continue
 
-    # Check for @secret or @public markers
+    # Check for @secret, @build, or @public markers
     if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*@secret ]]; then
-      next_is_secret=true
+      next_marker="secret"
+      continue
+    elif [[ "$line" =~ ^[[:space:]]*#[[:space:]]*@build ]]; then
+      next_marker="build"
       continue
     elif [[ "$line" =~ ^[[:space:]]*#[[:space:]]*@public ]]; then
-      next_is_secret=false
+      next_marker="public"
       continue
     fi
 
@@ -407,11 +414,16 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
       value="${value#\'}"
       value="${value%\'}"
 
-      # Classify based on marker
-      if [[ "$next_is_secret" == "true" ]]; then
+      # Classify based on marker (priority) or name (fallback)
+      if [[ "$next_marker" == "secret" ]]; then
         echo "$key" >> "$SECRET_KEYS_FILE"
         echo "$value" >> "$SECRET_VALUES_FILE"
         ((secret_count++))
+      elif [[ "$next_marker" == "build" ]] || [[ "$key" == NEXT_PUBLIC_* ]]; then
+        # @build tag or NEXT_PUBLIC_* auto-detected as build-time
+        echo "$key" >> "$BUILD_KEYS_FILE"
+        echo "$value" >> "$BUILD_VALUES_FILE"
+        ((build_count++))
       else
         echo "$key" >> "$ENV_KEYS_FILE"
         echo "$value" >> "$ENV_VALUES_FILE"
@@ -419,22 +431,30 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
       fi
 
       # Reset marker for next variable
-      next_is_secret=false
+      next_marker=""
     fi
   done < "$ENV_FILE"
 
   # Display grouped by type
   if [[ $secret_count -gt 0 ]]; then
     echo ""
-    echo -e "${RED}Secrets ($secret_count):${NC}"
+    echo -e "${RED}Secrets - GCP Secret Manager ($secret_count):${NC}"
     while IFS= read -r key; do
       echo "  • $key"
     done < "$SECRET_KEYS_FILE"
   fi
 
+  if [[ $build_count -gt 0 ]]; then
+    echo ""
+    echo -e "${YELLOW}Build-time Variables - GitHub Variables ($build_count):${NC}"
+    while IFS= read -r key; do
+      echo "  • $key"
+    done < "$BUILD_KEYS_FILE"
+  fi
+
   if [[ $env_count -gt 0 ]]; then
     echo ""
-    echo -e "${GREEN}Environment Variables ($env_count):${NC}"
+    echo -e "${GREEN}Runtime Variables - Cloud Run ($env_count):${NC}"
     while IFS= read -r key; do
       echo "  • $key"
     done < "$ENV_KEYS_FILE"
@@ -442,7 +462,7 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
 
   echo ""
 
-  if [[ $secret_count -gt 0 ]]; then
+  if [[ $secret_count -gt 0 ]] || [[ $build_count -gt 0 ]]; then
     read -p "Continue with this classification? (y/n) " -n 1 -r < /dev/tty
     echo ""
 
@@ -1004,6 +1024,14 @@ CD_FOOTER="
         working-directory: infra/gcp
         run: terraform apply -var-file=terraform.tfvars -var=\"image_tag=\${{ github.sha }}\" -auto-approve -input=false"
 
+# Build env vars string for CD workflow (build-time variables)
+CD_BUILD_ENV_VARS="          NODE_ENV: production"
+if [[ -f "$BUILD_KEYS_FILE" ]] && [[ -s "$BUILD_KEYS_FILE" ]]; then
+  while IFS= read -r key; do
+    CD_BUILD_ENV_VARS+="\n          $key: \${{ vars.$key }}"
+  done < "$BUILD_KEYS_FILE"
+fi
+
 case "$PROJECT_TYPE" in
   nodejs)
     CD_BUILD_STEPS="
@@ -1030,7 +1058,7 @@ case "$PROJECT_TYPE" in
       - name: Build application
         run: yarn build
         env:
-          NODE_ENV: production
+$(echo -e "$CD_BUILD_ENV_VARS")
 "
     ;;
   java-maven)
@@ -1221,7 +1249,16 @@ if command -v gh &> /dev/null; then
         log_success "Set GCP_SERVICE_ACCOUNT_EMAIL"
       fi
 
-      log_success "GitHub secrets configured in 'Production' environment!"
+      # Set build-time variables (NEXT_PUBLIC_* etc)
+      if [[ -f "$BUILD_KEYS_FILE" ]] && [[ -s "$BUILD_KEYS_FILE" ]]; then
+        log_info "Creating GitHub Variables for build-time env vars..."
+        while IFS= read -r key && IFS= read -r value <&3; do
+          echo "$value" | gh variable set "$key" --repo="$GITHUB_REPO" --env=Production
+          log_success "Set variable: $key"
+        done < "$BUILD_KEYS_FILE" 3< "$BUILD_VALUES_FILE"
+      fi
+
+      log_success "GitHub secrets and variables configured in 'Production' environment!"
     else
       log_warn "Skipped GitHub secrets configuration"
     fi
