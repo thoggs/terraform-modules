@@ -369,12 +369,10 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
       if [[ "$next_is_secret" == "true" ]]; then
         echo "$key" >> "$SECRET_KEYS_FILE"
         echo "$value" >> "$SECRET_VALUES_FILE"
-        log_info "  [SECRET] $key"
         ((secret_count++))
       else
         echo "$key" >> "$ENV_KEYS_FILE"
         echo "$value" >> "$ENV_VALUES_FILE"
-        log_info "  [ENV] $key"
         ((env_count++))
       fi
 
@@ -383,11 +381,23 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
     fi
   done < "$ENV_FILE"
 
-  # Show summary and ask for confirmation
-  echo ""
-  echo "Summary:"
-  echo "  Public env vars:  $env_count"
-  echo "  Secret env vars:  $secret_count"
+  # Display grouped by type
+  if [[ $secret_count -gt 0 ]]; then
+    echo ""
+    echo -e "${RED}Secrets ($secret_count):${NC}"
+    while IFS= read -r key; do
+      echo "  • $key"
+    done < "$SECRET_KEYS_FILE"
+  fi
+
+  if [[ $env_count -gt 0 ]]; then
+    echo ""
+    echo -e "${GREEN}Environment Variables ($env_count):${NC}"
+    while IFS= read -r key; do
+      echo "  • $key"
+    done < "$ENV_KEYS_FILE"
+  fi
+
   echo ""
 
   if [[ $secret_count -gt 0 ]]; then
