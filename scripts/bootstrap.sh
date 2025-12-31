@@ -1096,6 +1096,16 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
   log_info "Terraform init..."
   terraform init
 
+  # Import existing resources created by bootstrap
+  log_info "Importing existing resources into Terraform state..."
+
+  # Import Artifact Registry if it exists
+  if gcloud artifacts repositories describe "$SERVICE_NAME" --location="$REGION" &>/dev/null; then
+    terraform import -var-file=terraform.tfvars \
+      "module.artifact_registry.google_artifact_registry_repository.main" \
+      "projects/$PROJECT_ID/locations/$REGION/repositories/$SERVICE_NAME" 2>/dev/null || true
+  fi
+
   log_info "Terraform plan..."
   terraform plan -var-file=terraform.tfvars -out=tfplan
 
