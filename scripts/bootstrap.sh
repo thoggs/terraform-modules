@@ -782,7 +782,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.next/cache
-          key: ${{ runner.os }}-nextjs-${{ hashFiles('yarn.lock') }}-${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx') }}
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('yarn.lock') }}-${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx', '**/*.css', '**/*.scss') }}
           restore-keys: |
             ${{ runner.os }}-nextjs-${{ hashFiles('yarn.lock') }}-
 
@@ -1048,7 +1048,7 @@ case "$PROJECT_TYPE" in
         uses: actions/cache@v4
         with:
           path: \${{ github.workspace }}/.next/cache
-          key: \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-\${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx') }}
+          key: \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-\${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx', '**/*.css', '**/*.scss') }}
           restore-keys: |
             \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-
 
