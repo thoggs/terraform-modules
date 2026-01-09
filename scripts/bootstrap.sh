@@ -77,6 +77,22 @@ while [[ $# -gt 0 ]]; do
       PROJECT_TYPE="${1#*=}"
       shift
       ;;
+    --storage-bucket=*)
+      STORAGE_BUCKET="${1#*=}"
+      shift
+      ;;
+    --storage-service-account=*)
+      STORAGE_SERVICE_ACCOUNT="${1#*=}"
+      shift
+      ;;
+    --container-port=*)
+      CONTAINER_PORT="${1#*=}"
+      shift
+      ;;
+    --health-check-path=*)
+      HEALTH_CHECK_PATH="${1#*=}"
+      shift
+      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
@@ -93,11 +109,17 @@ while [[ $# -gt 0 ]]; do
       echo "  --custom-domain=DOMAIN     Custom domain for Cloud Run (e.g., app.example.com)"
       echo "  --provider=PROVIDER        Cloud provider: gcp (default), aws*, azure* (*coming soon)"
       echo "  --env-file=PATH            Environment file to process (auto-detects .env.local)"
-      echo "  --project-type=TYPE        Project type (required): nodejs, java-maven, java-gradle, docker-only"
+      echo "  --project-type=TYPE        Project type (required): nodejs, laravel-api, laravel-ssr, java-maven, java-gradle, docker-only"
+      echo "  --storage-bucket=NAME      GCS bucket name for application storage (grants objectAdmin to service account)"
+      echo "  --storage-service-account=EMAIL  Service account email to grant storage access (required with --storage-bucket)"
+      echo "  --container-port=PORT      Container port (default: 3000 for nodejs, 80 for laravel, 8080 for java)"
+      echo "  --health-check-path=PATH   Health check endpoint (default: /api/health for nodejs, /up for laravel)"
       echo "  --help                     Show this help"
       echo ""
       echo "Project types:"
       echo "  nodejs       - Node.js project (yarn/npm build before Docker)"
+      echo "  laravel-api  - Laravel API only (composer install, no frontend build)"
+      echo "  laravel-ssr  - Laravel with Inertia SSR (composer + yarn build)"
       echo "  java-maven   - Java project with Maven (mvn package before Docker)"
       echo "  java-gradle  - Java project with Gradle (./gradlew build before Docker)"
       echo "  docker-only  - Multi-stage Dockerfile handles everything"
@@ -154,17 +176,37 @@ fi
 
 if [[ -z "$PROJECT_TYPE" ]]; then
   log_error "Missing required argument: --project-type"
-  log_info "Options: nodejs, java-maven, java-gradle, docker-only"
+  log_info "Options: nodejs, laravel-api, laravel-ssr, java-maven, java-gradle, docker-only"
   exit 1
 fi
 
 case "$PROJECT_TYPE" in
-  nodejs|java-maven|java-gradle|docker-only)
+  nodejs|laravel-api|laravel-ssr|java-maven|java-gradle|docker-only)
     ;;
   *)
     log_error "Invalid project type: $PROJECT_TYPE"
-    log_info "Options: nodejs, java-maven, java-gradle, docker-only"
+    log_info "Options: nodejs, laravel-api, laravel-ssr, java-maven, java-gradle, docker-only"
     exit 1
+    ;;
+esac
+
+# Set defaults based on project type
+case "$PROJECT_TYPE" in
+  nodejs)
+    CONTAINER_PORT="${CONTAINER_PORT:-3000}"
+    HEALTH_CHECK_PATH="${HEALTH_CHECK_PATH:-/api/health}"
+    ;;
+  laravel-api|laravel-ssr)
+    CONTAINER_PORT="${CONTAINER_PORT:-80}"
+    HEALTH_CHECK_PATH="${HEALTH_CHECK_PATH:-/up}"
+    ;;
+  java-maven|java-gradle)
+    CONTAINER_PORT="${CONTAINER_PORT:-8080}"
+    HEALTH_CHECK_PATH="${HEALTH_CHECK_PATH:-/actuator/health}"
+    ;;
+  docker-only)
+    CONTAINER_PORT="${CONTAINER_PORT:-8080}"
+    HEALTH_CHECK_PATH="${HEALTH_CHECK_PATH:-/health}"
     ;;
 esac
 
@@ -260,6 +302,30 @@ for api in "${APIS[@]}"; do
 done
 log_success "All APIs enabled"
 
+# Configure storage bucket permissions if specified
+if [[ -n "$STORAGE_BUCKET" ]]; then
+  print_header "Step 3.5: Configuring Storage Bucket Permissions"
+
+  if [[ -z "$STORAGE_SERVICE_ACCOUNT" ]]; then
+    log_error "Missing required argument: --storage-service-account (required when using --storage-bucket)"
+    exit 1
+  fi
+
+  log_info "Granting storage.objectAdmin to $STORAGE_SERVICE_ACCOUNT on gs://$STORAGE_BUCKET..."
+
+  if gcloud storage buckets describe "gs://$STORAGE_BUCKET" &>/dev/null; then
+    gcloud storage buckets add-iam-policy-binding "gs://$STORAGE_BUCKET" \
+      --member="serviceAccount:$STORAGE_SERVICE_ACCOUNT" \
+      --role="roles/storage.objectAdmin" \
+      --quiet
+
+    log_success "Storage permissions granted"
+  else
+    log_error "Bucket $STORAGE_BUCKET does not exist"
+    exit 1
+  fi
+fi
+
 # Create state bucket
 print_header "Step 4: Creating Terraform State Bucket"
 
@@ -311,6 +377,23 @@ if [[ -f "$OUTPUT_DIR/Dockerfile" ]]; then
         npm run build
       fi
       log_success "Node.js application built"
+      ;;
+    laravel-api)
+      log_info "Building Laravel API application..."
+      composer install --no-dev --optimize-autoloader --no-interaction
+      log_success "Laravel API application built"
+      ;;
+    laravel-ssr)
+      log_info "Building Laravel SSR application..."
+      composer install --no-dev --optimize-autoloader --no-interaction
+      if command -v yarn &>/dev/null && [[ -f "yarn.lock" ]]; then
+        yarn install --immutable 2>/dev/null || yarn install
+        yarn build
+      elif command -v npm &>/dev/null; then
+        npm ci 2>/dev/null || npm install
+        npm run build
+      fi
+      log_success "Laravel SSR application built"
       ;;
     java-maven)
       log_info "Building Java application with Maven..."
@@ -859,6 +942,123 @@ jobs:
         run: ./gradlew build -x test
 EOF
     ;;
+  laravel-api)
+    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths-ignore:
+      - '*.md'
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo, pdo_pgsql, bcmath, intl, zip, gd, redis
+          coverage: none
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Run Pint (code style)
+        run: vendor/bin/pint --test
+
+      - name: Run tests
+        run: php artisan test --compact
+        env:
+          APP_ENV: testing
+EOF
+    ;;
+  laravel-ssr)
+    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths-ignore:
+      - '*.md'
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo, pdo_pgsql, bcmath, intl, zip, gd, redis
+          coverage: none
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - name: Install Node.js dependencies
+        run: yarn install --immutable
+
+      - name: Build frontend assets
+        run: yarn build
+
+      - name: Run Pint (code style)
+        run: vendor/bin/pint --test
+
+      - name: Run tests
+        run: php artisan test --compact
+        env:
+          APP_ENV: testing
+EOF
+    ;;
   docker-only)
     cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
 name: CI
@@ -1059,6 +1259,69 @@ case "$PROJECT_TYPE" in
         run: yarn build
         env:
 $(echo -e "$CD_BUILD_ENV_VARS")
+"
+    ;;
+  laravel-api)
+    CD_BUILD_STEPS="
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo, pdo_pgsql, bcmath, intl, zip, gd, redis
+          coverage: none
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: \${{ steps.composer-cache.outputs.dir }}
+          key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
+          restore-keys: \${{ runner.os }}-composer-
+
+      - name: Install dependencies
+        run: composer install --no-dev --optimize-autoloader --no-interaction
+"
+    ;;
+  laravel-ssr)
+    CD_BUILD_STEPS="
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo, pdo_pgsql, bcmath, intl, zip, gd, redis
+          coverage: none
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: \${{ steps.composer-cache.outputs.dir }}
+          key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
+          restore-keys: \${{ runner.os }}-composer-
+
+      - name: Install PHP dependencies
+        run: composer install --no-dev --optimize-autoloader --no-interaction
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - name: Install Node.js dependencies
+        run: yarn install --immutable
+
+      - name: Build frontend assets
+        run: yarn build
 "
     ;;
   java-maven)
