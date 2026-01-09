@@ -419,13 +419,13 @@ if [[ -f "$OUTPUT_DIR/Dockerfile" ]]; then
   esac
   cd - > /dev/null
 
-  log_info "Building Docker image (linux/amd64)..."
+  log_info "Building Docker image (linux/amd64,linux/arm64)..."
 
   # Use buildx for multiplatform build
   if docker buildx version &>/dev/null; then
     # Create builder if needed
     docker buildx create --name multiarch --use 2>/dev/null || docker buildx use multiarch 2>/dev/null || true
-    docker buildx build --platform linux/amd64 -t "$IMAGE_NAME" "$OUTPUT_DIR" --push
+    docker buildx build --platform linux/amd64,linux/arm64 -t "$IMAGE_NAME" "$OUTPUT_DIR" --push
   else
     docker build -t "$IMAGE_NAME" "$OUTPUT_DIR"
     log_info "Pushing image to Artifact Registry..."
@@ -441,10 +441,24 @@ fi
 # Process environment variables
 ENV_VARS_TF=""
 SECRET_ENV_VARS_TF=""
+CLOUD_SQL_INSTANCE=""
 
-# Auto-detect .env.local if --env-file not specified
-if [[ -z "$ENV_FILE" && -f "$OUTPUT_DIR/.env.local" ]]; then
-  ENV_FILE="$OUTPUT_DIR/.env.local"
+# Auto-detect env file if --env-file not specified
+if [[ -z "$ENV_FILE" ]]; then
+  case "$PROJECT_TYPE" in
+    laravel-api|laravel-ssr)
+      # Laravel uses .env.production
+      if [[ -f "$OUTPUT_DIR/.env.production" ]]; then
+        ENV_FILE="$OUTPUT_DIR/.env.production"
+      fi
+      ;;
+    *)
+      # Other projects use .env.local
+      if [[ -f "$OUTPUT_DIR/.env.local" ]]; then
+        ENV_FILE="$OUTPUT_DIR/.env.local"
+      fi
+      ;;
+  esac
 fi
 
 if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
@@ -455,9 +469,11 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
   echo "┌────────────────────────────────────────────────────────────────────┐"
   echo "│  Annotation syntax:                                                │"
   echo "│    # @secret    → GCP Secret Manager (runtime)                     │"
-  echo "│    # @build     → GitHub Variables (build-time, e.g. NEXT_PUBLIC)  │"
+  echo "│    # @build     → GitHub Variables (build-time)                    │"
   echo "│    # @public    → Cloud Run env vars (runtime, default)            │"
+  if [[ "$PROJECT_TYPE" == "nodejs" ]]; then
   echo "│    NEXT_PUBLIC_* without tag → auto-detected as @build             │"
+  fi
   echo "└────────────────────────────────────────────────────────────────────┘"
   echo ""
 
@@ -510,8 +526,8 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
         echo "$key" >> "$SECRET_KEYS_FILE"
         echo "$value" >> "$SECRET_VALUES_FILE"
         ((secret_count++))
-      elif [[ "$next_marker" == "build" ]] || [[ "$key" == NEXT_PUBLIC_* ]]; then
-        # @build tag or NEXT_PUBLIC_* auto-detected as build-time
+      elif [[ "$next_marker" == "build" ]] || { [[ "$PROJECT_TYPE" == "nodejs" ]] && [[ "$key" == NEXT_PUBLIC_* ]]; }; then
+        # @build tag or NEXT_PUBLIC_* auto-detected as build-time (nodejs only)
         echo "$key" >> "$BUILD_KEYS_FILE"
         echo "$value" >> "$BUILD_VALUES_FILE"
         ((build_count++))
@@ -519,6 +535,11 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
         echo "$key" >> "$ENV_KEYS_FILE"
         echo "$value" >> "$ENV_VALUES_FILE"
         ((env_count++))
+      fi
+
+      # Auto-detect Cloud SQL from DB_HOST=/cloudsql/...
+      if [[ "$key" == "DB_HOST" && "$value" == /cloudsql/* ]]; then
+        CLOUD_SQL_INSTANCE="${value#/cloudsql/}"
       fi
 
       # Reset marker for next variable
@@ -549,6 +570,12 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
     while IFS= read -r key; do
       echo "  • $key"
     done < "$ENV_KEYS_FILE"
+  fi
+
+  if [[ -n "$CLOUD_SQL_INSTANCE" ]]; then
+    echo ""
+    echo -e "${BLUE}Cloud SQL Connection (auto-detected):${NC}"
+    echo "  • $CLOUD_SQL_INSTANCE"
   fi
 
   echo ""
@@ -630,6 +657,7 @@ $(echo -e "$SECRET_ENV_VARS_TF")
 }
 
 custom_domain = "${CUSTOM_DOMAIN:-}"
+cloudsql_instance = "${CLOUD_SQL_INSTANCE:-}"
 EOF
 log_success "Created infra/gcp/terraform.tfvars"
 
@@ -701,6 +729,8 @@ module "cloud_run" {
   custom_domain       = var.custom_domain
   allow_public_access = var.allow_public_access
   deletion_protection = var.deletion_protection
+
+  cloudsql_instances = var.cloudsql_instance != "" ? [var.cloudsql_instance] : []
 
   depends_on = [module.artifact_registry]
 }
@@ -796,6 +826,12 @@ variable "image_tag" {
   description = "Docker image tag for Cloud Run deployment"
   type        = string
   default     = "latest"
+}
+
+variable "cloudsql_instance" {
+  description = "Cloud SQL instance connection name (project:region:instance)"
+  type        = string
+  default     = ""
 }
 EOF
 log_success "Created infra/gcp/variables.tf"
