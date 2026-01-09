@@ -294,6 +294,7 @@ APIS=(
   "iam.googleapis.com"
   "iamcredentials.googleapis.com"
   "cloudresourcemanager.googleapis.com"
+  "sqladmin.googleapis.com"
 )
 
 for api in "${APIS[@]}"; do
@@ -380,20 +381,10 @@ if [[ -f "$OUTPUT_DIR/Dockerfile" ]]; then
       ;;
     laravel-api)
       log_info "Building Laravel API application..."
-      if [[ -d "vendor" ]]; then
-        log_info "Cleaning vendor directory for production install..."
-        rm -rf vendor
-      fi
-      composer install --no-dev --optimize-autoloader --no-interaction
-      log_success "Laravel API application built"
+      log_success "Laravel API ready (composer install runs inside Docker)"
       ;;
     laravel-ssr)
       log_info "Building Laravel SSR application..."
-      if [[ -d "vendor" ]]; then
-        log_info "Cleaning vendor directory for production install..."
-        rm -rf vendor
-      fi
-      composer install --no-dev --optimize-autoloader --no-interaction
       if command -v yarn &>/dev/null && [[ -f "yarn.lock" ]]; then
         yarn install --immutable 2>/dev/null || yarn install
         yarn build
@@ -401,7 +392,7 @@ if [[ -f "$OUTPUT_DIR/Dockerfile" ]]; then
         npm ci 2>/dev/null || npm install
         npm run build
       fi
-      log_success "Laravel SSR application built"
+      log_success "Laravel SSR application built (composer install runs inside Docker)"
       ;;
     java-maven)
       log_info "Building Java application with Maven..."
@@ -542,6 +533,11 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
         CLOUD_SQL_INSTANCE="${value#/cloudsql/}"
       fi
 
+      # Capture DB_DATABASE for Cloud SQL database creation
+      if [[ "$key" == "DB_DATABASE" ]]; then
+        DB_DATABASE="$value"
+      fi
+
       # Reset marker for next variable
       next_marker=""
     fi
@@ -611,6 +607,26 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
     done < "$SECRET_KEYS_FILE" 3< "$SECRET_VALUES_FILE"
 
     log_success "Secrets created in Secret Manager"
+  fi
+
+  # Create Cloud SQL database if detected
+  if [[ -n "$CLOUD_SQL_INSTANCE" && -n "$DB_DATABASE" ]]; then
+    # Extract instance name from connection string (project:region:instance -> instance)
+    INSTANCE_NAME="${CLOUD_SQL_INSTANCE##*:}"
+
+    log_info "Checking Cloud SQL database: $DB_DATABASE on instance $INSTANCE_NAME..."
+
+    if gcloud sql databases describe "$DB_DATABASE" --instance="$INSTANCE_NAME" &>/dev/null; then
+      log_success "Database $DB_DATABASE already exists"
+    else
+      log_info "Creating database: $DB_DATABASE"
+      if gcloud sql databases create "$DB_DATABASE" --instance="$INSTANCE_NAME"; then
+        log_success "Database $DB_DATABASE created"
+      else
+        log_warn "Failed to create database. You may need to create it manually:"
+        log_warn "  gcloud sql databases create $DB_DATABASE --instance=$INSTANCE_NAME"
+      fi
+    fi
   fi
 
   # Build terraform env_vars
