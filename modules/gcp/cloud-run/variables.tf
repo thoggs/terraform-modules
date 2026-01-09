@@ -147,3 +147,9 @@ variable "domain_force_override" {
   type        = bool
   default     = true
 }
+
+variable "cloudsql_instances" {
+  description = "List of Cloud SQL instance connection names (project:region:instance)"
+  type        = list(string)
+  default     = []
+}
