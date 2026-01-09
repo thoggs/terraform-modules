@@ -380,11 +380,19 @@ if [[ -f "$OUTPUT_DIR/Dockerfile" ]]; then
       ;;
     laravel-api)
       log_info "Building Laravel API application..."
+      if [[ -d "vendor" ]]; then
+        log_info "Cleaning vendor directory for production install..."
+        rm -rf vendor
+      fi
       composer install --no-dev --optimize-autoloader --no-interaction
       log_success "Laravel API application built"
       ;;
     laravel-ssr)
       log_info "Building Laravel SSR application..."
+      if [[ -d "vendor" ]]; then
+        log_info "Cleaning vendor directory for production install..."
+        rm -rf vendor
+      fi
       composer install --no-dev --optimize-autoloader --no-interaction
       if command -v yarn &>/dev/null && [[ -f "yarn.lock" ]]; then
         yarn install --immutable 2>/dev/null || yarn install
