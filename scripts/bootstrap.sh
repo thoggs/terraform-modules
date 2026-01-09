@@ -691,6 +691,9 @@ $(echo -e "$SECRET_ENV_VARS_TF")
 
 custom_domain = "${CUSTOM_DOMAIN:-}"
 cloudsql_instance = "${CLOUD_SQL_INSTANCE:-}"
+
+container_port    = $CONTAINER_PORT
+health_check_path = "$HEALTH_CHECK_PATH"
 EOF
 log_success "Created infra/gcp/terraform.tfvars"
 
@@ -762,6 +765,9 @@ module "cloud_run" {
   custom_domain       = var.custom_domain
   allow_public_access = var.allow_public_access
   deletion_protection = var.deletion_protection
+
+  container_port    = var.container_port
+  health_check_path = var.health_check_path
 
   cloudsql_instances = var.cloudsql_instance != "" ? [var.cloudsql_instance] : []
 
@@ -865,6 +871,18 @@ variable "cloudsql_instance" {
   description = "Cloud SQL instance connection name (project:region:instance)"
   type        = string
   default     = ""
+}
+
+variable "container_port" {
+  description = "Container port"
+  type        = number
+  default     = 3000
+}
+
+variable "health_check_path" {
+  description = "Health check endpoint path"
+  type        = string
+  default     = "/api/health"
 }
 EOF
 log_success "Created infra/gcp/variables.tf"
