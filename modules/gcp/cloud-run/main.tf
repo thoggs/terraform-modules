@@ -62,11 +62,29 @@ resource "google_cloud_run_v2_service" "main" {
         period_seconds    = var.liveness_probe_period
         failure_threshold = var.liveness_probe_failure_threshold
       }
+
+      dynamic "volume_mounts" {
+        for_each = length(var.cloudsql_instances) > 0 ? [1] : []
+        content {
+          name       = "cloudsql"
+          mount_path = "/cloudsql"
+        }
+      }
     }
 
     scaling {
       min_instance_count = var.min_instances
       max_instance_count = var.max_instances
+    }
+
+    dynamic "volumes" {
+      for_each = length(var.cloudsql_instances) > 0 ? [1] : []
+      content {
+        name = "cloudsql"
+        cloud_sql_instance {
+          instances = var.cloudsql_instances
+        }
+      }
     }
 
     timeout = var.timeout
@@ -95,6 +113,13 @@ resource "google_project_iam_member" "cloud_run_secret_accessor" {
   count   = length(var.secret_env_vars) > 0 ? 1 : 0
   project = var.project_id
   role    = "roles/secretmanager.secretAccessor"
+  member  = "serviceAccount:${google_service_account.cloud_run.email}"
+}
+
+resource "google_project_iam_member" "cloud_run_cloudsql_client" {
+  count   = length(var.cloudsql_instances) > 0 ? 1 : 0
+  project = var.project_id
+  role    = "roles/cloudsql.client"
   member  = "serviceAccount:${google_service_account.cloud_run.email}"
 }
 
