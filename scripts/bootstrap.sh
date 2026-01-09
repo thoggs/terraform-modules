@@ -614,14 +614,47 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
   fi
 
   # Build terraform env_vars
+  # First, create a lookup file for variable resolution
+  ALL_KEYS_FILE=$(mktemp)
+  ALL_VALUES_FILE=$(mktemp)
+  cat "$ENV_KEYS_FILE" "$SECRET_KEYS_FILE" "$BUILD_KEYS_FILE" > "$ALL_KEYS_FILE" 2>/dev/null || true
+  cat "$ENV_VALUES_FILE" "$SECRET_VALUES_FILE" "$BUILD_VALUES_FILE" > "$ALL_VALUES_FILE" 2>/dev/null || true
+
+  # Function to resolve ${VAR} references
+  resolve_env_refs() {
+    local value="$1"
+    local resolved="$value"
+    # Match ${VAR} pattern and replace with actual value
+    while [[ "$resolved" =~ \$\{([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+      local var_name="${BASH_REMATCH[1]}"
+      local var_value=""
+      # Look up the value from our parsed env vars
+      local line_num=1
+      while IFS= read -r k; do
+        if [[ "$k" == "$var_name" ]]; then
+          var_value=$(sed -n "${line_num}p" "$ALL_VALUES_FILE")
+          break
+        fi
+        ((line_num++))
+      done < "$ALL_KEYS_FILE"
+      # Replace the reference with the value (or empty if not found)
+      resolved="${resolved/\$\{$var_name\}/$var_value}"
+    done
+    echo "$resolved"
+  }
+
   ENV_VARS_TF="  NODE_ENV = \"production\"\n"
   if [[ $env_count -gt 0 ]]; then
     while IFS= read -r key && IFS= read -r value <&3; do
+      # Resolve ${VAR} references
+      resolved_value=$(resolve_env_refs "$value")
       # Escape special characters for terraform
-      escaped_value=$(echo "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      escaped_value=$(echo "$resolved_value" | sed 's/\\/\\\\/g; s/"/\\"/g')
       ENV_VARS_TF+="  $key = \"$escaped_value\"\n"
     done < "$ENV_KEYS_FILE" 3< "$ENV_VALUES_FILE"
   fi
+
+  rm -f "$ALL_KEYS_FILE" "$ALL_VALUES_FILE"
 
   log_success "Environment variables processed"
 else
