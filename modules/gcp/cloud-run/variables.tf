@@ -153,3 +153,9 @@ variable "cloudsql_instances" {
   type        = list(string)
   default     = []
 }
+
+variable "storage_buckets" {
+  description = "List of GCS bucket names to grant objectAdmin access to the service account"
+  type        = list(string)
+  default     = []
+}

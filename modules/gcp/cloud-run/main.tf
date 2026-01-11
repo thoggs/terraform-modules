@@ -123,6 +123,20 @@ resource "google_project_iam_member" "cloud_run_cloudsql_client" {
   member  = "serviceAccount:${google_service_account.cloud_run.email}"
 }
 
+resource "google_storage_bucket_iam_member" "cloud_run_storage_admin" {
+  for_each = toset(var.storage_buckets)
+  bucket   = each.value
+  role     = "roles/storage.objectAdmin"
+  member   = "serviceAccount:${google_service_account.cloud_run.email}"
+}
+
+resource "google_service_account_iam_member" "cloud_run_token_creator" {
+  count              = length(var.storage_buckets) > 0 ? 1 : 0
+  service_account_id = google_service_account.cloud_run.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${google_service_account.cloud_run.email}"
+}
+
 resource "google_cloud_run_service_iam_member" "public_access" {
   count    = var.allow_public_access ? 1 : 0
   location = google_cloud_run_v2_service.main.location
