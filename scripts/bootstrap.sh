@@ -81,10 +81,6 @@ while [[ $# -gt 0 ]]; do
       STORAGE_BUCKET="${1#*=}"
       shift
       ;;
-    --storage-service-account=*)
-      STORAGE_SERVICE_ACCOUNT="${1#*=}"
-      shift
-      ;;
     --container-port=*)
       CONTAINER_PORT="${1#*=}"
       shift
@@ -110,8 +106,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --provider=PROVIDER        Cloud provider: gcp (default), aws*, azure* (*coming soon)"
       echo "  --env-file=PATH            Environment file to process (auto-detects .env.local)"
       echo "  --project-type=TYPE        Project type (required): nodejs, laravel-api, laravel-ssr, java-maven, java-gradle, docker-only"
-      echo "  --storage-bucket=NAME      GCS bucket name for application storage (grants objectAdmin to service account)"
-      echo "  --storage-service-account=EMAIL  Service account email to grant storage access (required with --storage-bucket)"
+      echo "  --storage-bucket=NAME      GCS bucket name for application storage (Terraform grants objectAdmin to Cloud Run SA)"
       echo "  --container-port=PORT      Container port (default: 3000 for nodejs, 80 for laravel, 8080 for java)"
       echo "  --health-check-path=PATH   Health check endpoint (default: /api/health for nodejs, /up for laravel)"
       echo "  --help                     Show this help"
@@ -302,30 +297,6 @@ for api in "${APIS[@]}"; do
   gcloud services enable "$api" --quiet
 done
 log_success "All APIs enabled"
-
-# Configure storage bucket permissions if specified
-if [[ -n "$STORAGE_BUCKET" ]]; then
-  print_header "Step 3.5: Configuring Storage Bucket Permissions"
-
-  if [[ -z "$STORAGE_SERVICE_ACCOUNT" ]]; then
-    log_error "Missing required argument: --storage-service-account (required when using --storage-bucket)"
-    exit 1
-  fi
-
-  log_info "Granting storage.objectAdmin to $STORAGE_SERVICE_ACCOUNT on gs://$STORAGE_BUCKET..."
-
-  if gcloud storage buckets describe "gs://$STORAGE_BUCKET" &>/dev/null; then
-    gcloud storage buckets add-iam-policy-binding "gs://$STORAGE_BUCKET" \
-      --member="serviceAccount:$STORAGE_SERVICE_ACCOUNT" \
-      --role="roles/storage.objectAdmin" \
-      --quiet
-
-    log_success "Storage permissions granted"
-  else
-    log_error "Bucket $STORAGE_BUCKET does not exist"
-    exit 1
-  fi
-fi
 
 # Create state bucket
 print_header "Step 4: Creating Terraform State Bucket"
@@ -707,6 +678,7 @@ $(echo -e "$SECRET_ENV_VARS_TF")
 
 custom_domain = "${CUSTOM_DOMAIN:-}"
 cloudsql_instance = "${CLOUD_SQL_INSTANCE:-}"
+storage_buckets = [$(if [[ -n "$STORAGE_BUCKET" ]]; then echo "\"$STORAGE_BUCKET\""; fi)]
 
 container_port    = $CONTAINER_PORT
 health_check_path = "$HEALTH_CHECK_PATH"
@@ -786,6 +758,7 @@ module "cloud_run" {
   health_check_path = var.health_check_path
 
   cloudsql_instances = var.cloudsql_instance != "" ? [var.cloudsql_instance] : []
+  storage_buckets    = var.storage_buckets
 
   depends_on = [module.artifact_registry]
 }
@@ -899,6 +872,12 @@ variable "health_check_path" {
   description = "Health check endpoint path"
   type        = string
   default     = "/api/health"
+}
+
+variable "storage_buckets" {
+  description = "List of GCS bucket names to grant objectAdmin access to Cloud Run service account"
+  type        = list(string)
+  default     = []
 }
 EOF
 log_success "Created infra/gcp/variables.tf"
@@ -1095,6 +1074,11 @@ jobs:
       - name: Install dependencies
         run: composer install --no-interaction --prefer-dist --optimize-autoloader
 
+      - name: Prepare Laravel
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
       - name: Run Pint (code style)
         run: vendor/bin/pint --test
 
@@ -1145,6 +1129,11 @@ jobs:
 
       - name: Install PHP dependencies
         run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Prepare Laravel
+        run: |
+          cp .env.example .env
+          php artisan key:generate
 
       - name: Enable Corepack
         run: corepack enable
