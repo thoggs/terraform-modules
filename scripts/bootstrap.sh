@@ -61,6 +61,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_TERRAFORM=true
       shift
       ;;
+    --yes|-y)
+      AUTO_APPROVE=true
+      shift
+      ;;
     --custom-domain=*)
       CUSTOM_DOMAIN="${1#*=}"
       shift
@@ -106,6 +110,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --output-dir=PATH          Output directory for generated files (default: current dir)"
       echo "  --create-project           Create new GCP project"
       echo "  --skip-terraform           Skip terraform init/plan/apply"
+      echo "  --yes, -y                  Auto-approve all prompts (skip confirmations)"
       echo "  --custom-domain=DOMAIN     Custom domain for Cloud Run (e.g., app.example.com)"
       echo "  --provider=PROVIDER        Cloud provider: gcp (default), aws*, azure* (*coming soon)"
       echo "  --env-file=PATH            Environment file to process (auto-detects .env.local)"
@@ -555,12 +560,14 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
   echo ""
 
   if [[ $secret_count -gt 0 ]] || [[ $build_count -gt 0 ]]; then
-    read -p "Continue with this classification? (y/n) " -n 1 -r < /dev/tty
-    echo ""
+    if [[ "$AUTO_APPROVE" != "true" ]]; then
+      read -p "Continue with this classification? (y/n) " -n 1 -r < /dev/tty
+      echo ""
 
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-      log_warn "Aborted. Please update your .env file with @secret/@public markers and try again."
-      exit 1
+      if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_warn "Aborted. Please update your .env file with @secret/@public markers and try again."
+        exit 1
+      fi
     fi
   fi
 
@@ -1555,10 +1562,18 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
   terraform plan -var-file=terraform.tfvars -out=tfplan
 
   echo ""
-  read -p "Apply this plan? (y/n) " -n 1 -r < /dev/tty
-  echo ""
+  APPLY_PLAN="false"
+  if [[ "$AUTO_APPROVE" == "true" ]]; then
+    APPLY_PLAN="true"
+  else
+    read -p "Apply this plan? (y/n) " -n 1 -r < /dev/tty
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      APPLY_PLAN="true"
+    fi
+  fi
 
-  if [[ $REPLY =~ ^[Yy]$ ]]; then
+  if [[ "$APPLY_PLAN" == "true" ]]; then
     log_info "Terraform apply..."
 
     # Retry logic for IAM propagation delays
@@ -1625,10 +1640,18 @@ if command -v gh &> /dev/null; then
     log_success "GitHub CLI authenticated"
 
     echo ""
-    read -p "Configure GitHub secrets automatically? (y/n) " -n 1 -r < /dev/tty
-    echo ""
+    CONFIGURE_SECRETS="false"
+    if [[ "$AUTO_APPROVE" == "true" ]]; then
+      CONFIGURE_SECRETS="true"
+    else
+      read -p "Configure GitHub secrets automatically? (y/n) " -n 1 -r < /dev/tty
+      echo ""
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        CONFIGURE_SECRETS="true"
+      fi
+    fi
 
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if [[ "$CONFIGURE_SECRETS" == "true" ]]; then
       log_info "Configuring GitHub secrets for $GITHUB_REPO (environment: Production)..."
 
       # Create Production environment if it doesn't exist
