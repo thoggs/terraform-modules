@@ -97,6 +97,10 @@ while [[ $# -gt 0 ]]; do
       REGISTRY_NAME="${1#*=}"
       shift
       ;;
+    --tf-state-bucket=*)
+      TF_STATE_BUCKET="${1#*=}"
+      shift
+      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
@@ -119,6 +123,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --container-port=PORT      Container port (default: 3000 for nodejs, 80 for laravel, 8080 for java)"
       echo "  --health-check-path=PATH   Health check endpoint (default: /api/health for nodejs, /up for laravel)"
       echo "  --registry-name=NAME       Artifact Registry name (default: same as service-name)"
+      echo "  --tf-state-bucket=NAME     GCS bucket name for Terraform state (default: {project-id}-tfstate)"
       echo "  --help                     Show this help"
       echo ""
       echo "Project types:"
@@ -221,8 +226,8 @@ if [[ "$CREATE_PROJECT" == "true" && -z "$BILLING_ACCOUNT" ]]; then
   exit 1
 fi
 
-# State bucket name
-STATE_BUCKET="${PROJECT_ID}-tfstate"
+# Terraform state bucket name (custom or default: {project-id}-tfstate)
+STATE_BUCKET="${TF_STATE_BUCKET:-${PROJECT_ID}-tfstate}"
 
 # Directory paths
 INFRA_DIR="$OUTPUT_DIR/infra/gcp"
