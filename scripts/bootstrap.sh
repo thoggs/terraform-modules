@@ -89,6 +89,10 @@ while [[ $# -gt 0 ]]; do
       HEALTH_CHECK_PATH="${1#*=}"
       shift
       ;;
+    --registry-name=*)
+      REGISTRY_NAME="${1#*=}"
+      shift
+      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
@@ -109,6 +113,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --storage-bucket=NAME      GCS bucket name for application storage (Terraform grants objectAdmin to Cloud Run SA)"
       echo "  --container-port=PORT      Container port (default: 3000 for nodejs, 80 for laravel, 8080 for java)"
       echo "  --health-check-path=PATH   Health check endpoint (default: /api/health for nodejs, /up for laravel)"
+      echo "  --registry-name=NAME       Artifact Registry name (default: same as service-name)"
       echo "  --help                     Show this help"
       echo ""
       echo "Project types:"
@@ -140,6 +145,7 @@ PROVIDER="${PROVIDER:-gcp}"
 REGION="${REGION:-us-central1}"
 TERRAFORM_MODULES_REPO="${TERRAFORM_MODULES_REPO:-thoggs/terraform-modules}"
 OUTPUT_DIR="${OUTPUT_DIR:-.}"
+REGISTRY_NAME="${REGISTRY_NAME:-$SERVICE_NAME}"
 
 # Validate provider
 if [[ "$PROVIDER" != "gcp" ]]; then
@@ -224,6 +230,7 @@ echo "  Provider:         $PROVIDER"
 echo "  Project ID:       $PROJECT_ID"
 echo "  Region:           $REGION"
 echo "  Service Name:     $SERVICE_NAME"
+echo "  Registry Name:    $REGISTRY_NAME"
 echo "  GitHub Repo:      $GITHUB_REPO"
 echo "  Modules Repo:     $TERRAFORM_MODULES_REPO"
 echo "  State Bucket:     $STATE_BUCKET"
@@ -314,19 +321,19 @@ fi
 # Create Artifact Registry and push initial image
 print_header "Step 5: Building & Pushing Initial Docker Image"
 
-ARTIFACT_REGISTRY="$REGION-docker.pkg.dev/$PROJECT_ID/$SERVICE_NAME"
+ARTIFACT_REGISTRY="$REGION-docker.pkg.dev/$PROJECT_ID/$REGISTRY_NAME"
 IMAGE_NAME="$ARTIFACT_REGISTRY/$SERVICE_NAME:latest"
 
 # Create Artifact Registry if it doesn't exist
-if ! gcloud artifacts repositories describe "$SERVICE_NAME" --location="$REGION" &>/dev/null; then
-  log_info "Creating Artifact Registry: $SERVICE_NAME"
-  gcloud artifacts repositories create "$SERVICE_NAME" \
+if ! gcloud artifacts repositories describe "$REGISTRY_NAME" --location="$REGION" &>/dev/null; then
+  log_info "Creating Artifact Registry: $REGISTRY_NAME"
+  gcloud artifacts repositories create "$REGISTRY_NAME" \
     --repository-format=docker \
     --location="$REGION" \
     --description="Docker repository for $SERVICE_NAME"
   log_success "Artifact Registry created"
 else
-  log_warn "Artifact Registry $SERVICE_NAME already exists"
+  log_warn "Artifact Registry $REGISTRY_NAME already exists"
 fi
 
 # Configure Docker authentication
@@ -643,9 +650,22 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
 
   rm -f "$ALL_KEYS_FILE" "$ALL_VALUES_FILE"
 
+  if [[ "$PROJECT_TYPE" == "laravel-api" ]] || [[ "$PROJECT_TYPE" == "laravel-ssr" ]]; then
+    if ! grep -q "^  LOG_STACK = " <<< "$ENV_VARS_TF"; then
+      log_info "Adding cloud-native logging defaults for Laravel..."
+      ENV_VARS_TF+="  LOG_STACK = \"stderr\"\n"
+      log_success "Set LOG_STACK=stderr (required for container environments)"
+    fi
+  fi
+
   log_success "Environment variables processed"
 else
   ENV_VARS_TF="  NODE_ENV = \"production\""
+
+  if [[ "$PROJECT_TYPE" == "laravel-api" ]] || [[ "$PROJECT_TYPE" == "laravel-ssr" ]]; then
+    ENV_VARS_TF+="\n  LOG_STACK = \"stderr\""
+  fi
+
   log_info "No env file found, using defaults"
 fi
 
@@ -658,10 +678,11 @@ log_success "Created directories: infra/gcp/, .github/workflows/"
 
 # Create terraform.tfvars
 cat > "$INFRA_DIR/terraform.tfvars" << EOF
-project_id   = "$PROJECT_ID"
-region       = "$REGION"
-service_name = "$SERVICE_NAME"
-github_repo  = "$GITHUB_REPO"
+project_id    = "$PROJECT_ID"
+region        = "$REGION"
+service_name  = "$SERVICE_NAME"
+registry_name = "$REGISTRY_NAME"
+github_repo   = "$GITHUB_REPO"
 
 cloud_run_cpu           = "1"
 cloud_run_memory        = "512Mi"
@@ -710,6 +731,10 @@ provider "google" {
   add_terraform_attribution_label = true
 }
 
+locals {
+  registry_name = var.registry_name != "" ? var.registry_name : var.service_name
+}
+
 module "workload_identity" {
   source = "github.com/$TERRAFORM_MODULES_REPO//modules/gcp/workload-identity?ref=main"
 
@@ -724,7 +749,7 @@ module "artifact_registry" {
   source = "github.com/$TERRAFORM_MODULES_REPO//modules/gcp/artifact-registry?ref=main"
 
   region        = var.region
-  repository_id = var.service_name
+  repository_id = local.registry_name
   description   = "Docker repository for \${var.service_name}"
 }
 
@@ -734,7 +759,7 @@ module "cloud_run" {
   project_id   = var.project_id
   region       = var.region
   service_name = var.service_name
-  image        = "\${var.region}-docker.pkg.dev/\${var.project_id}/\${var.service_name}/\${var.service_name}:\${var.image_tag}"
+  image        = "\${var.region}-docker.pkg.dev/\${var.project_id}/\${local.registry_name}/\${var.service_name}:\${var.image_tag}"
 
   cpu           = var.cloud_run_cpu
   memory        = var.cloud_run_memory
@@ -779,8 +804,14 @@ variable "region" {
 }
 
 variable "service_name" {
-  description = "Service name (used for Cloud Run, Artifact Registry, etc.)"
+  description = "Service name (used for Cloud Run service)"
   type        = string
+}
+
+variable "registry_name" {
+  description = "Artifact Registry repository name (defaults to service_name if not specified)"
+  type        = string
+  default     = ""
 }
 
 variable "github_repo" {
@@ -1274,6 +1305,7 @@ permissions:
 env:
   REGION: $REGION
   SERVICE_NAME: $SERVICE_NAME
+  REGISTRY_NAME: $REGISTRY_NAME
   PROJECT_ID: $PROJECT_ID
 
 jobs:
@@ -1303,13 +1335,13 @@ jobs:
 CD_FOOTER="
       - name: Build Docker image
         run: |
-          docker build -t \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} .
-          docker tag \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
+          docker build -t \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.REGISTRY_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} .
+          docker tag \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.REGISTRY_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }} \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.REGISTRY_NAME }}/\${{ env.SERVICE_NAME }}:latest
 
       - name: Push Docker image
         run: |
-          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
-          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.SERVICE_NAME }}/\${{ env.SERVICE_NAME }}:latest
+          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.REGISTRY_NAME }}/\${{ env.SERVICE_NAME }}:\${{ github.sha }}
+          docker push \${{ env.REGION }}-docker.pkg.dev/\${{ env.PROJECT_ID }}/\${{ env.REGISTRY_NAME }}/\${{ env.SERVICE_NAME }}:latest
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -1470,10 +1502,11 @@ log_success "Created infra/gcp/.gitignore"
 
 # Create tfvars example
 cat > "$INFRA_DIR/terraform.tfvars.example" << EOF
-project_id   = "$PROJECT_ID"
-region       = "$REGION"
-service_name = "$SERVICE_NAME"
-github_repo  = "$GITHUB_REPO"
+project_id    = "$PROJECT_ID"
+region        = "$REGION"
+service_name  = "$SERVICE_NAME"
+registry_name = "$REGISTRY_NAME"
+github_repo   = "$GITHUB_REPO"
 
 cloud_run_cpu           = "1"
 cloud_run_memory        = "512Mi"
@@ -1507,12 +1540,12 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
   log_info "Importing existing resources into Terraform state..."
 
   # Import Artifact Registry if it exists and not already in state
-  if gcloud artifacts repositories describe "$SERVICE_NAME" --location="$REGION" &>/dev/null; then
+  if gcloud artifacts repositories describe "$REGISTRY_NAME" --location="$REGION" &>/dev/null; then
     if ! terraform state show "module.artifact_registry.google_artifact_registry_repository.main" &>/dev/null; then
-      log_info "Importing existing Artifact Registry: $SERVICE_NAME"
+      log_info "Importing existing Artifact Registry: $REGISTRY_NAME"
       terraform import -var-file=terraform.tfvars \
         "module.artifact_registry.google_artifact_registry_repository.main" \
-        "projects/$PROJECT_ID/locations/$REGION/repositories/$SERVICE_NAME"
+        "projects/$PROJECT_ID/locations/$REGION/repositories/$REGISTRY_NAME"
     else
       log_success "Artifact Registry already in Terraform state"
     fi
