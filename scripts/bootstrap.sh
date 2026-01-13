@@ -526,6 +526,13 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
         DB_DATABASE="$value"
       fi
 
+      # Auto-detect GCS bucket from GOOGLE_CLOUD_STORAGE_BUCKET
+      if [[ "$key" == "GOOGLE_CLOUD_STORAGE_BUCKET" && -n "$value" ]]; then
+        if [[ -z "$STORAGE_BUCKET" ]]; then
+          STORAGE_BUCKET="$value"
+        fi
+      fi
+
       # Reset marker for next variable
       next_marker=""
     fi
@@ -560,6 +567,12 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
     echo ""
     echo -e "${BLUE}Cloud SQL Connection (auto-detected):${NC}"
     echo "  • $CLOUD_SQL_INSTANCE"
+  fi
+
+  if [[ -n "$STORAGE_BUCKET" ]]; then
+    echo ""
+    echo -e "${BLUE}GCS Storage Bucket (auto-detected from GOOGLE_CLOUD_STORAGE_BUCKET):${NC}"
+    echo "  • $STORAGE_BUCKET"
   fi
 
   echo ""
@@ -764,6 +777,11 @@ module "artifact_registry" {
   region        = var.region
   repository_id = local.registry_name
   description   = "Docker repository for \${var.service_name}"
+
+  # Cleanup policies - keep storage costs low for large images
+  delete_untagged         = true
+  keep_recent_count       = var.registry_keep_recent_count
+  delete_older_than_hours = var.registry_delete_older_than_hours
 }
 
 # Secret Manager - Terraform managed secrets with service prefix
@@ -954,6 +972,18 @@ variable "storage_buckets" {
   description = "List of GCS bucket names to grant objectAdmin access to Cloud Run service account"
   type        = list(string)
   default     = []
+}
+
+variable "registry_keep_recent_count" {
+  description = "Number of recent Docker images to keep in Artifact Registry"
+  type        = number
+  default     = 1
+}
+
+variable "registry_delete_older_than_hours" {
+  description = "Delete Docker images older than N hours from Artifact Registry"
+  type        = number
+  default     = 1
 }
 EOF
 log_success "Created infra/gcp/variables.tf"
@@ -1159,7 +1189,7 @@ case "$PROJECT_TYPE" in
     ;;
 esac
 
-# Create combined CI workflow
+# Create CI workflow
 CI_CONTENT="name: CI
 
 on:
@@ -1173,7 +1203,6 @@ on:
 permissions:
   contents: read
   pull-requests: read
-  id-token: write
 
 jobs:
   build:
@@ -1185,63 +1214,10 @@ jobs:
         uses: actions/checkout@v6
 
 $CI_BUILD_STEPS
-
-  terraform:
-    name: Terraform Plan
-    needs: build
-    runs-on: ubuntu-latest
-    environment: Production
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Check for infra changes
-        uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            infra:
-              - 'infra/**'
-
-      - name: Authenticate to Google Cloud
-        if: steps.filter.outputs.infra == 'true'
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: \${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: \${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
-
-      - name: Setup Terraform
-        if: steps.filter.outputs.infra == 'true'
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: \"~> 1.10\"
-
-      - name: Terraform Init
-        if: steps.filter.outputs.infra == 'true'
-        working-directory: infra/gcp
-        run: terraform init
-
-      - name: Terraform Format
-        if: steps.filter.outputs.infra == 'true'
-        working-directory: infra/gcp
-        run: terraform fmt -check
-
-      - name: Terraform Plan
-        if: steps.filter.outputs.infra == 'true'
-        working-directory: infra/gcp
-        env:
-          TF_VAR_image_tag: latest
-$CI_SECRET_ENV_BLOCK
-        run: terraform plan -var-file=terraform.tfvars -input=false
-
-      - name: No infra changes
-        if: steps.filter.outputs.infra != 'true'
-        run: echo \"No infrastructure changes detected, skipping Terraform\"
 "
 
 echo -e "$CI_CONTENT" > "$WORKFLOWS_DIR/ci.yml"
-log_success "Created .github/workflows/ci.yml (build + terraform)"
+log_success "Created .github/workflows/ci.yml"
 
 # Generate CD workflow based on project type
 # Common header for all project types
@@ -1922,8 +1898,8 @@ echo "    ├── terraform.tfvars"
 echo "    ├── terraform.tfvars.example"
 echo "    └── .gitignore"
 echo "  $WORKFLOWS_DIR/"
-echo "    ├── ci.yml              (build + terraform plan - runs on PR)"
-echo "    └── cd.yml              (build + terraform apply - runs on push to main)"
+echo "    ├── ci.yml              (build & test - runs on PR)"
+echo "    └── cd.yml              (build + deploy - runs on push to main)"
 echo ""
 echo "Next steps:"
 echo "  1. Review generated files"
