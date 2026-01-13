@@ -1276,7 +1276,7 @@ jobs:
         if: steps.filter.outputs.infra == 'true'
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "~> 1.5"
+          terraform_version: "~> 1.10"
 
       - name: Terraform Init
         if: steps.filter.outputs.infra == 'true'
@@ -1358,7 +1358,7 @@ CD_FOOTER="
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: \"~> 1.5\"
+          terraform_version: \"~> 1.10\"
 
       - name: Terraform Init
         working-directory: infra/gcp
@@ -1581,8 +1581,91 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
   if [[ "$APPLY_PLAN" == "true" ]]; then
     log_info "Terraform apply..."
 
-    # Retry logic for IAM propagation delays
-    max_retries=3
+    # Function to import existing resources
+    import_existing_resources() {
+      local output="$1"
+      local imported=false
+
+      # Import Cloud Run Service Account if already exists and not in state
+      if echo "$output" | grep -q "${SERVICE_NAME}-run already exists"; then
+        if ! terraform state show 'module.cloud_run.google_service_account.cloud_run' &>/dev/null; then
+          log_info "Importing existing Cloud Run Service Account..."
+          if terraform import -var-file=terraform.tfvars \
+            'module.cloud_run.google_service_account.cloud_run' \
+            "projects/$PROJECT_ID/serviceAccounts/${SERVICE_NAME}-run@${PROJECT_ID}.iam.gserviceaccount.com" 2>/dev/null; then
+            log_success "Cloud Run Service Account imported"
+            imported=true
+          fi
+        else
+          log_warn "Cloud Run Service Account already in state"
+        fi
+      fi
+
+      # Import GitHub Actions Service Account if already exists and not in state
+      if echo "$output" | grep -q "github-actions already exists"; then
+        if ! terraform state show 'module.workload_identity.google_service_account.github_actions' &>/dev/null; then
+          log_info "Importing existing GitHub Actions Service Account..."
+          if terraform import -var-file=terraform.tfvars \
+            'module.workload_identity.google_service_account.github_actions' \
+            "projects/$PROJECT_ID/serviceAccounts/github-actions@${PROJECT_ID}.iam.gserviceaccount.com" 2>/dev/null; then
+            log_success "GitHub Actions Service Account imported"
+            imported=true
+          fi
+        else
+          log_warn "GitHub Actions Service Account already in state"
+        fi
+      fi
+
+      # Import Workload Identity Pool if already exists and not in state
+      if echo "$output" | grep -q "WorkloadIdentityPool.*already exists\|workload_identity_pool.*already exists"; then
+        if ! terraform state show 'module.workload_identity.google_iam_workload_identity_pool.github' &>/dev/null; then
+          log_info "Importing existing Workload Identity Pool..."
+          if terraform import -var-file=terraform.tfvars \
+            'module.workload_identity.google_iam_workload_identity_pool.github' \
+            "projects/$PROJECT_ID/locations/global/workloadIdentityPools/github-pool" 2>/dev/null; then
+            log_success "Workload Identity Pool imported"
+            imported=true
+          fi
+        else
+          log_warn "Workload Identity Pool already in state"
+        fi
+      fi
+
+      # Import Workload Identity Provider if already exists and not in state
+      if echo "$output" | grep -q "WorkloadIdentityPoolProvider.*already exists\|workload_identity_pool_provider.*already exists"; then
+        if ! terraform state show 'module.workload_identity.google_iam_workload_identity_pool_provider.github' &>/dev/null; then
+          log_info "Importing existing Workload Identity Provider..."
+          if terraform import -var-file=terraform.tfvars \
+            'module.workload_identity.google_iam_workload_identity_pool_provider.github' \
+            "projects/$PROJECT_ID/locations/global/workloadIdentityPools/github-pool/providers/github-provider" 2>/dev/null; then
+            log_success "Workload Identity Provider imported"
+            imported=true
+          fi
+        else
+          log_warn "Workload Identity Provider already in state"
+        fi
+      fi
+
+      # Import Domain Mapping if already exists and not in state
+      if echo "$output" | grep -q "DomainMapping.*already exists\|Resource '.*' already exists"; then
+        if ! terraform state show 'module.cloud_run.google_cloud_run_domain_mapping.main[0]' &>/dev/null; then
+          log_info "Importing existing Domain Mapping..."
+          if terraform import -var-file=terraform.tfvars \
+            'module.cloud_run.google_cloud_run_domain_mapping.main[0]' \
+            "locations/$REGION/namespaces/$PROJECT_ID/domainmappings/$CUSTOM_DOMAIN" 2>/dev/null; then
+            log_success "Domain Mapping imported"
+            imported=true
+          fi
+        else
+          log_warn "Domain Mapping already in state"
+        fi
+      fi
+
+      echo "$imported"
+    }
+
+    # Retry logic for IAM propagation delays (~10 minutes max)
+    max_retries=20
     retry_count=0
     apply_success=false
 
@@ -1598,8 +1681,22 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
         apply_success=true
         break
       else
-        # Only retry on IAM/permission errors
-        if echo "$apply_output" | grep -qiE "(permission denied|iam|secretAccessor|403|access denied)"; then
+        # Check for "already exists" errors (409) - need to import
+        if echo "$apply_output" | grep -qE "Error 409.*already exists|alreadyExists"; then
+          log_warn "Resources already exist. Attempting auto-import..."
+          imported=$(import_existing_resources "$apply_output")
+
+          if [[ "$imported" == "true" ]]; then
+            log_success "Resources imported. Regenerating plan..."
+            terraform plan -var-file=terraform.tfvars -out=tfplan
+            ((retry_count++))
+            continue
+          fi
+        fi
+
+        # Check for IAM/permission propagation errors
+        if echo "$apply_output" | grep -qiE "(permission denied|secretAccessor|403|access denied)" && \
+           ! echo "$apply_output" | grep -qE "Error 409.*already exists"; then
           ((retry_count++))
           if [[ $retry_count -lt $max_retries ]]; then
             log_warn "IAM permission error detected (attempt $retry_count/$max_retries). Waiting 30s for propagation..."
@@ -1608,9 +1705,11 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
             terraform plan -var-file=terraform.tfvars -out=tfplan
           fi
         else
-          # Non-IAM error, don't retry
-          log_error "Terraform apply failed with non-retryable error"
-          exit 1
+          # Non-retryable error
+          if [[ "$imported" != "true" ]]; then
+            log_error "Terraform apply failed with non-retryable error"
+            exit 1
+          fi
         fi
       fi
     done
