@@ -581,7 +581,7 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
     log_info "Creating secrets in GCP Secret Manager..."
 
     while IFS= read -r key && IFS= read -r value <&3; do
-      secret_name=$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+      secret_name="${SERVICE_NAME}-$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
 
       # Check if secret exists
       if gcloud secrets describe "$secret_name" &>/dev/null; then
@@ -597,6 +597,25 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
     done < "$SECRET_KEYS_FILE" 3< "$SECRET_VALUES_FILE"
 
     log_success "Secrets created in Secret Manager"
+
+    # Cleanup old secret versions (keep only latest 2 versions per secret)
+    log_info "Cleaning up old secret versions..."
+    cleaned_count=0
+    while IFS= read -r key <&4; do
+      secret_name="${SERVICE_NAME}-$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+      # Get all versions except the 2 most recent
+      old_versions=$(gcloud secrets versions list "$secret_name" --format="value(name)" --filter="state=enabled" 2>/dev/null | tail -n +3)
+      if [[ -n "$old_versions" ]]; then
+        while IFS= read -r version; do
+          if [[ -n "$version" ]]; then
+            gcloud secrets versions destroy "$version" --secret="$secret_name" --quiet 2>/dev/null && ((cleaned_count++))
+          fi
+        done <<< "$old_versions"
+      fi
+    done 4< "$SECRET_KEYS_FILE"
+    if [[ $cleaned_count -gt 0 ]]; then
+      log_success "Cleaned up $cleaned_count old secret version(s)"
+    fi
   fi
 
   # Create Cloud SQL database if detected
@@ -1366,7 +1385,35 @@ CD_FOOTER="
 
       - name: Terraform Apply
         working-directory: infra/gcp
-        run: terraform apply -var-file=terraform.tfvars -var=\"image_tag=\${{ github.sha }}\" -auto-approve -input=false"
+        run: terraform apply -var-file=terraform.tfvars -var=\"image_tag=\${{ github.sha }}\" -auto-approve -input=false
+
+      - name: Cleanup old secret versions
+        run: |
+          echo \"Cleaning up old secret versions for \${{ env.SERVICE_NAME }}-* (keeping latest 2)...\"
+          for secret in \$(gcloud secrets list --format=\"value(name)\" --filter=\"name~^\${{ env.SERVICE_NAME }}-\" 2>/dev/null); do
+            old_versions=\$(gcloud secrets versions list \"\$secret\" --format=\"value(name)\" --filter=\"state=enabled\" 2>/dev/null | tail -n +3)
+            if [[ -n \"\$old_versions\" ]]; then
+              while IFS= read -r version; do
+                [[ -n \"\$version\" ]] && gcloud secrets versions destroy \"\$version\" --secret=\"\$secret\" --quiet 2>/dev/null || true
+              done <<< \"\$old_versions\"
+            fi
+          done
+          echo \"Secret versions cleanup complete\"
+
+      - name: Cleanup unused secrets
+        working-directory: infra/gcp
+        run: |
+          echo \"Checking for unused secrets (prefix: \${{ env.SERVICE_NAME }}-)...\"
+          SECRETS_IN_USE=\$(grep -A 100 'secret_env_vars' terraform.tfvars | grep -E '^\\s+\\w+\\s*=' | awk '{print \$3}' | tr -d '\"' | sort -u)
+          SECRETS_IN_GCP=\$(gcloud secrets list --format=\"value(name)\" --filter=\"name~^\${{ env.SERVICE_NAME }}-\" 2>/dev/null)
+          deleted_count=0
+          for secret in \$SECRETS_IN_GCP; do
+            if ! echo \"\$SECRETS_IN_USE\" | grep -q \"^\${secret}\\\$\"; then
+              echo \"Deleting unused secret: \$secret\"
+              gcloud secrets delete \"\$secret\" --quiet 2>/dev/null && ((deleted_count++)) || true
+            fi
+          done
+          [[ \$deleted_count -gt 0 ]] && echo \"Deleted \$deleted_count unused secret(s)\" || echo \"No unused secrets found\""
 
 # Build env vars string for CD workflow (build-time variables)
 CD_BUILD_ENV_VARS="          NODE_ENV: production"
@@ -1563,6 +1610,27 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
     fi
   fi
 
+  # Handle existing Domain Mapping (prevents 20min hang on create)
+  if [[ -n "$CUSTOM_DOMAIN" ]]; then
+    if gcloud run domain-mappings describe --domain="$CUSTOM_DOMAIN" --region="$REGION" &>/dev/null; then
+      if ! terraform state show 'module.cloud_run.google_cloud_run_domain_mapping.main[0]' &>/dev/null; then
+        log_warn "Domain Mapping exists but not in Terraform state: $CUSTOM_DOMAIN"
+        log_info "Deleting existing Domain Mapping to let Terraform recreate it..."
+        if gcloud run domain-mappings delete --domain="$CUSTOM_DOMAIN" --region="$REGION" --quiet; then
+          log_success "Domain Mapping deleted, Terraform will recreate it"
+        else
+          log_warn "Could not delete domain mapping, attempting import..."
+          terraform import -var-file=terraform.tfvars \
+            'module.cloud_run.google_cloud_run_domain_mapping.main[0]' \
+            "locations/$REGION/namespaces/$PROJECT_ID/domainmappings/$CUSTOM_DOMAIN" || \
+            log_warn "Import failed, Terraform may hang on apply"
+        fi
+      else
+        log_success "Domain Mapping already in Terraform state"
+      fi
+    fi
+  fi
+
   log_info "Terraform plan..."
   terraform plan -var-file=terraform.tfvars -out=tfplan
 
@@ -1647,14 +1715,23 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
       fi
 
       # Import Domain Mapping if already exists and not in state
-      if echo "$output" | grep -q "DomainMapping.*already exists\|Resource '.*' already exists"; then
+      if echo "$output" | grep -qE "DomainMapping.*already exists|Resource '.*\..*' already exists"; then
         if ! terraform state show 'module.cloud_run.google_cloud_run_domain_mapping.main[0]' &>/dev/null; then
-          log_info "Importing existing Domain Mapping..."
-          if terraform import -var-file=terraform.tfvars \
-            'module.cloud_run.google_cloud_run_domain_mapping.main[0]' \
-            "locations/$REGION/namespaces/$PROJECT_ID/domainmappings/$CUSTOM_DOMAIN" 2>/dev/null; then
-            log_success "Domain Mapping imported"
-            imported=true
+          # Extract domain from error message if CUSTOM_DOMAIN not set
+          local domain_to_import="$CUSTOM_DOMAIN"
+          if [[ -z "$domain_to_import" ]]; then
+            domain_to_import=$(echo "$output" | grep -oE "Resource '[^']+' already exists" | grep -oE "'[^']+'" | tr -d "'" | head -1)
+          fi
+          if [[ -n "$domain_to_import" ]]; then
+            log_info "Importing existing Domain Mapping: $domain_to_import"
+            if terraform import -var-file=terraform.tfvars \
+              'module.cloud_run.google_cloud_run_domain_mapping.main[0]' \
+              "locations/$REGION/namespaces/$PROJECT_ID/domainmappings/$domain_to_import"; then
+              log_success "Domain Mapping imported"
+              imported=true
+            else
+              log_warn "Failed to import Domain Mapping"
+            fi
           fi
         else
           log_warn "Domain Mapping already in state"
