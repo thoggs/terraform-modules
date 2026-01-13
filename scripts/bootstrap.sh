@@ -576,46 +576,18 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
     fi
   fi
 
-  # Create secrets in GCP Secret Manager
+  # Build secret keys list for terraform.tfvars (values will come from GitHub Secrets)
   if [[ $secret_count -gt 0 ]]; then
-    log_info "Creating secrets in GCP Secret Manager..."
+    log_info "Preparing secrets configuration (Terraform managed)..."
 
-    while IFS= read -r key && IFS= read -r value <&3; do
-      secret_name="${SERVICE_NAME}-$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+    # Store secret keys for later GitHub Secrets configuration
+    SECRET_KEYS_LIST=""
+    while IFS= read -r key; do
+      SECRET_KEYS_LIST+="$key "
+    done < "$SECRET_KEYS_FILE"
 
-      # Check if secret exists
-      if gcloud secrets describe "$secret_name" &>/dev/null; then
-        log_warn "Secret $secret_name already exists, adding new version..."
-        echo -n "$value" | gcloud secrets versions add "$secret_name" --data-file=-
-      else
-        log_info "Creating secret: $secret_name"
-        echo -n "$value" | gcloud secrets create "$secret_name" --data-file=- --replication-policy="automatic"
-      fi
-
-      # Build terraform secret_env_vars
-      SECRET_ENV_VARS_TF+="  $key = \"$secret_name\"\n"
-    done < "$SECRET_KEYS_FILE" 3< "$SECRET_VALUES_FILE"
-
-    log_success "Secrets created in Secret Manager"
-
-    # Cleanup old secret versions (keep only latest 2 versions per secret)
-    log_info "Cleaning up old secret versions..."
-    cleaned_count=0
-    while IFS= read -r key <&4; do
-      secret_name="${SERVICE_NAME}-$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
-      # Get all versions except the 2 most recent
-      old_versions=$(gcloud secrets versions list "$secret_name" --format="value(name)" --filter="state=enabled" 2>/dev/null | tail -n +3)
-      if [[ -n "$old_versions" ]]; then
-        while IFS= read -r version; do
-          if [[ -n "$version" ]]; then
-            gcloud secrets versions destroy "$version" --secret="$secret_name" --quiet 2>/dev/null && ((cleaned_count++))
-          fi
-        done <<< "$old_versions"
-      fi
-    done 4< "$SECRET_KEYS_FILE"
-    if [[ $cleaned_count -gt 0 ]]; then
-      log_success "Cleaned up $cleaned_count old secret version(s)"
-    fi
+    log_success "Secrets will be managed by Terraform via GitHub Secrets"
+    log_info "Secret keys: $SECRET_KEYS_LIST"
   fi
 
   # Create Cloud SQL database if detected
@@ -724,9 +696,19 @@ env_vars = {
 $(echo -e "$ENV_VARS_TF")
 }
 
-secret_env_vars = {
-$(echo -e "$SECRET_ENV_VARS_TF")
-}
+# Secret keys (values are passed via -var in CI/CD from GitHub Secrets)
+# Terraform creates secrets in GCP Secret Manager with prefix: ${SERVICE_NAME}-
+secret_keys = [$(if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+  first=true
+  while IFS= read -r key; do
+    if [[ "$first" == "true" ]]; then
+      first=false
+    else
+      echo -n ", "
+    fi
+    echo -n "\"$key\""
+  done < "$SECRET_KEYS_FILE"
+fi)]
 
 custom_domain = "${CUSTOM_DOMAIN:-}"
 cloudsql_instance = "${CLOUD_SQL_INSTANCE:-}"
@@ -784,6 +766,31 @@ module "artifact_registry" {
   description   = "Docker repository for \${var.service_name}"
 }
 
+# Secret Manager - Terraform managed secrets with service prefix
+resource "google_secret_manager_secret" "secrets" {
+  for_each  = toset(var.secret_keys)
+  secret_id = "\${var.service_name}-\${lower(replace(each.value, "_", "-"))}"
+
+  replication {
+    auto {}
+  }
+
+  labels = {
+    service = var.service_name
+    managed = "terraform"
+  }
+}
+
+resource "google_secret_manager_secret_version" "secrets" {
+  for_each    = toset(var.secret_keys)
+  secret      = google_secret_manager_secret.secrets[each.value].id
+  secret_data = var.secret_values[each.value]
+
+  lifecycle {
+    ignore_changes = [secret_data]
+  }
+}
+
 module "cloud_run" {
   source = "github.com/$TERRAFORM_MODULES_REPO//modules/gcp/cloud-run?ref=main"
 
@@ -800,8 +807,8 @@ module "cloud_run" {
   env_vars = var.env_vars
 
   secret_env_vars = {
-    for name, secret_name in var.secret_env_vars : name => {
-      secret_id = secret_name
+    for name in var.secret_keys : name => {
+      secret_id = google_secret_manager_secret.secrets[name].secret_id
       version   = "latest"
     }
   }
@@ -816,7 +823,7 @@ module "cloud_run" {
   cloudsql_instances = var.cloudsql_instance != "" ? [var.cloudsql_instance] : []
   storage_buckets    = var.storage_buckets
 
-  depends_on = [module.artifact_registry]
+  depends_on = [module.artifact_registry, google_secret_manager_secret_version.secrets]
 }
 EOF
 log_success "Created infra/gcp/main.tf"
@@ -900,10 +907,17 @@ variable "env_vars" {
   default     = {}
 }
 
-variable "secret_env_vars" {
-  description = "Secret environment variables mapping (ENV_NAME => secret_value)"
+variable "secret_keys" {
+  description = "List of secret environment variable names. Used for creating Secret Manager secrets with service_name prefix."
+  type        = list(string)
+  default     = []
+}
+
+variable "secret_values" {
+  description = "Map of secret values (ENV_NAME => value). Values come from GitHub Secrets via -var in CI/CD."
   type        = map(string)
   default     = {}
+  sensitive   = true
 }
 
 variable "custom_domain" {
@@ -978,33 +992,30 @@ log_info "Formatting terraform files..."
 terraform -chdir="$INFRA_DIR" fmt > /dev/null
 log_success "Terraform files formatted"
 
-# Create CI workflow (build only)
+# Create combined CI workflow (build + terraform)
 print_header "Step 7: Creating GitHub Workflows"
 
-# Generate CI workflow based on project type
+# Build dummy TF_VAR_secret_values for CI (placeholder values for plan)
+CI_SECRET_ENV_BLOCK=""
+if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+  CI_SECRET_ENV_BLOCK="          TF_VAR_secret_values: |"
+  CI_SECRET_ENV_BLOCK+="\n            {"
+  first_key=true
+  while IFS= read -r key; do
+    if [[ "$first_key" == "true" ]]; then
+      first_key=false
+    else
+      CI_SECRET_ENV_BLOCK+=","
+    fi
+    CI_SECRET_ENV_BLOCK+="\n              \"$key\": \"placeholder-for-ci\""
+  done < "$SECRET_KEYS_FILE"
+  CI_SECRET_ENV_BLOCK+="\n            }"
+fi
+
+# Generate build steps based on project type
 case "$PROJECT_TYPE" in
   nodejs)
-    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
-name: CI
-
-on:
-  pull_request:
-    branches:
-      - develop
-      - main
-    paths-ignore:
-      - '*.md'
-
-jobs:
-  build:
-    name: Build & Validate
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Enable Corepack
+    CI_BUILD_STEPS="      - name: Enable Corepack
         run: corepack enable
 
       - name: Setup Node.js
@@ -1016,10 +1027,10 @@ jobs:
       - name: Cache Next.js build
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/.next/cache
-          key: ${{ runner.os }}-nextjs-${{ hashFiles('yarn.lock') }}-${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx', '**/*.css', '**/*.scss') }}
+          path: \${{ github.workspace }}/.next/cache
+          key: \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-\${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx', '**/*.css', '**/*.scss') }}
           restore-keys: |
-            ${{ runner.os }}-nextjs-${{ hashFiles('yarn.lock') }}-
+            \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-
 
       - name: Install dependencies
         run: yarn install --immutable
@@ -1027,31 +1038,11 @@ jobs:
       - name: Build application
         run: yarn build
         env:
-          NODE_ENV: production
-EOF
+          NODE_ENV: production"
+    CI_BUILD_NAME="Build & Validate"
     ;;
   java-maven)
-    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
-name: CI
-
-on:
-  pull_request:
-    branches:
-      - develop
-      - main
-    paths-ignore:
-      - '*.md'
-
-jobs:
-  build:
-    name: Build & Validate
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Setup Java
+    CI_BUILD_STEPS="      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -1059,31 +1050,11 @@ jobs:
           cache: maven
 
       - name: Build with Maven
-        run: mvn package -DskipTests
-EOF
+        run: mvn package -DskipTests"
+    CI_BUILD_NAME="Build & Validate"
     ;;
   java-gradle)
-    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
-name: CI
-
-on:
-  pull_request:
-    branches:
-      - develop
-      - main
-    paths-ignore:
-      - '*.md'
-
-jobs:
-  build:
-    name: Build & Validate
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Setup Java
+    CI_BUILD_STEPS="      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -1091,31 +1062,11 @@ jobs:
           cache: gradle
 
       - name: Build with Gradle
-        run: ./gradlew build -x test
-EOF
+        run: ./gradlew build -x test"
+    CI_BUILD_NAME="Build & Validate"
     ;;
   laravel-api)
-    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
-name: CI
-
-on:
-  pull_request:
-    branches:
-      - develop
-      - main
-    paths-ignore:
-      - '*.md'
-
-jobs:
-  build:
-    name: Build & Test
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Setup PHP
+    CI_BUILD_STEPS="      - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
@@ -1124,14 +1075,14 @@ jobs:
 
       - name: Get Composer cache directory
         id: composer-cache
-        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+        run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
 
       - name: Cache Composer dependencies
         uses: actions/cache@v4
         with:
-          path: ${{ steps.composer-cache.outputs.dir }}
-          key: ${{ runner.os }}-composer-${{ hashFiles('composer.lock') }}
-          restore-keys: ${{ runner.os }}-composer-
+          path: \${{ steps.composer-cache.outputs.dir }}
+          key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
+          restore-keys: \${{ runner.os }}-composer-
 
       - name: Install dependencies
         run: composer install --no-interaction --prefer-dist --optimize-autoloader
@@ -1147,31 +1098,11 @@ jobs:
       - name: Run tests
         run: php artisan test --compact
         env:
-          APP_ENV: testing
-EOF
+          APP_ENV: testing"
+    CI_BUILD_NAME="Build & Test"
     ;;
   laravel-ssr)
-    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
-name: CI
-
-on:
-  pull_request:
-    branches:
-      - develop
-      - main
-    paths-ignore:
-      - '*.md'
-
-jobs:
-  build:
-    name: Build & Test
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Setup PHP
+    CI_BUILD_STEPS="      - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
@@ -1180,14 +1111,14 @@ jobs:
 
       - name: Get Composer cache directory
         id: composer-cache
-        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+        run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
 
       - name: Cache Composer dependencies
         uses: actions/cache@v4
         with:
-          path: ${{ steps.composer-cache.outputs.dir }}
-          key: ${{ runner.os }}-composer-${{ hashFiles('composer.lock') }}
-          restore-keys: ${{ runner.os }}-composer-
+          path: \${{ steps.composer-cache.outputs.dir }}
+          key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
+          restore-keys: \${{ runner.os }}-composer-
 
       - name: Install PHP dependencies
         run: composer install --no-interaction --prefer-dist --optimize-autoloader
@@ -1218,40 +1149,18 @@ jobs:
       - name: Run tests
         run: php artisan test --compact
         env:
-          APP_ENV: testing
-EOF
+          APP_ENV: testing"
+    CI_BUILD_NAME="Build & Test"
     ;;
   docker-only)
-    cat > "$WORKFLOWS_DIR/ci.yml" << 'EOF'
-name: CI
-
-on:
-  pull_request:
-    branches:
-      - develop
-      - main
-    paths-ignore:
-      - '*.md'
-
-jobs:
-  build:
-    name: Build & Validate
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Build Docker image (validation)
-        run: docker build -t test-build .
-EOF
+    CI_BUILD_STEPS="      - name: Build Docker image (validation)
+        run: docker build -t test-build ."
+    CI_BUILD_NAME="Build & Validate"
     ;;
 esac
-log_success "Created .github/workflows/ci.yml"
 
-# Create CI Terraform workflow
-cat > "$WORKFLOWS_DIR/ci-terraform.yml" << EOF
-name: CI Terraform
+# Create combined CI workflow
+CI_CONTENT="name: CI
 
 on:
   pull_request:
@@ -1267,8 +1176,19 @@ permissions:
   id-token: write
 
 jobs:
+  build:
+    name: $CI_BUILD_NAME
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+$CI_BUILD_STEPS
+
   terraform:
     name: Terraform Plan
+    needs: build
     runs-on: ubuntu-latest
     environment: Production
 
@@ -1295,7 +1215,7 @@ jobs:
         if: steps.filter.outputs.infra == 'true'
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "~> 1.10"
+          terraform_version: \"~> 1.10\"
 
       - name: Terraform Init
         if: steps.filter.outputs.infra == 'true'
@@ -1310,13 +1230,18 @@ jobs:
       - name: Terraform Plan
         if: steps.filter.outputs.infra == 'true'
         working-directory: infra/gcp
-        run: terraform plan -var-file=terraform.tfvars -var="image_tag=latest" -input=false
+        env:
+          TF_VAR_image_tag: latest
+$CI_SECRET_ENV_BLOCK
+        run: terraform plan -var-file=terraform.tfvars -input=false
 
       - name: No infra changes
         if: steps.filter.outputs.infra != 'true'
-        run: echo "No infrastructure changes detected, skipping Terraform"
-EOF
-log_success "Created .github/workflows/ci-terraform.yml"
+        run: echo \"No infrastructure changes detected, skipping Terraform\"
+"
+
+echo -e "$CI_CONTENT" > "$WORKFLOWS_DIR/ci.yml"
+log_success "Created .github/workflows/ci.yml (build + terraform)"
 
 # Generate CD workflow based on project type
 # Common header for all project types
@@ -1385,35 +1310,10 @@ CD_FOOTER="
 
       - name: Terraform Apply
         working-directory: infra/gcp
-        run: terraform apply -var-file=terraform.tfvars -var=\"image_tag=\${{ github.sha }}\" -auto-approve -input=false
-
-      - name: Cleanup old secret versions
-        run: |
-          echo \"Cleaning up old secret versions for \${{ env.SERVICE_NAME }}-* (keeping latest 2)...\"
-          for secret in \$(gcloud secrets list --format=\"value(name)\" --filter=\"name~^\${{ env.SERVICE_NAME }}-\" 2>/dev/null); do
-            old_versions=\$(gcloud secrets versions list \"\$secret\" --format=\"value(name)\" --filter=\"state=enabled\" 2>/dev/null | tail -n +3)
-            if [[ -n \"\$old_versions\" ]]; then
-              while IFS= read -r version; do
-                [[ -n \"\$version\" ]] && gcloud secrets versions destroy \"\$version\" --secret=\"\$secret\" --quiet 2>/dev/null || true
-              done <<< \"\$old_versions\"
-            fi
-          done
-          echo \"Secret versions cleanup complete\"
-
-      - name: Cleanup unused secrets
-        working-directory: infra/gcp
-        run: |
-          echo \"Checking for unused secrets (prefix: \${{ env.SERVICE_NAME }}-)...\"
-          SECRETS_IN_USE=\$(grep -A 100 'secret_env_vars' terraform.tfvars | grep -E '^\\s+\\w+\\s*=' | awk '{print \$3}' | tr -d '\"' | sort -u)
-          SECRETS_IN_GCP=\$(gcloud secrets list --format=\"value(name)\" --filter=\"name~^\${{ env.SERVICE_NAME }}-\" 2>/dev/null)
-          deleted_count=0
-          for secret in \$SECRETS_IN_GCP; do
-            if ! echo \"\$SECRETS_IN_USE\" | grep -q \"^\${secret}\\\$\"; then
-              echo \"Deleting unused secret: \$secret\"
-              gcloud secrets delete \"\$secret\" --quiet 2>/dev/null && ((deleted_count++)) || true
-            fi
-          done
-          [[ \$deleted_count -gt 0 ]] && echo \"Deleted \$deleted_count unused secret(s)\" || echo \"No unused secrets found\""
+        env:
+          TF_VAR_image_tag: \${{ github.sha }}
+__SECRET_ENV_PLACEHOLDER__
+        run: terraform apply -var-file=terraform.tfvars -auto-approve -input=false"
 
 # Build env vars string for CD workflow (build-time variables)
 CD_BUILD_ENV_VARS="          NODE_ENV: production"
@@ -1546,6 +1446,27 @@ $(echo -e "$CD_BUILD_ENV_VARS")
     ;;
 esac
 
+# Build TF_VAR_secret_values env var for Terraform (JSON format)
+if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+  SECRET_ENV_BLOCK="          TF_VAR_secret_values: |"
+  SECRET_ENV_BLOCK+="\n            {"
+  first_key=true
+  while IFS= read -r key; do
+    if [[ "$first_key" == "true" ]]; then
+      first_key=false
+    else
+      SECRET_ENV_BLOCK+=","
+    fi
+    SECRET_ENV_BLOCK+="\n              \"$key\": \"\${{ secrets.$key }}\""
+  done < "$SECRET_KEYS_FILE"
+  SECRET_ENV_BLOCK+="\n            }"
+else
+  SECRET_ENV_BLOCK=""
+fi
+
+# Replace placeholder with actual secret env vars
+CD_FOOTER="${CD_FOOTER/__SECRET_ENV_PLACEHOLDER__/$SECRET_ENV_BLOCK}"
+
 echo -e "${CD_HEADER}${CD_BUILD_STEPS}${CD_FOOTER}" > "$WORKFLOWS_DIR/cd.yml"
 log_success "Created .github/workflows/cd.yml"
 
@@ -1595,6 +1516,21 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
   log_info "Terraform init..."
   terraform init
 
+  # Build secret_values for local terraform commands
+  SECRET_VALUES_VAR=""
+  if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+    SECRET_VAR_ITEMS=""
+    while IFS= read -r key && IFS= read -r value <&3; do
+      if [[ -n "$SECRET_VAR_ITEMS" ]]; then
+        SECRET_VAR_ITEMS+=","
+      fi
+      # Escape special characters in value
+      escaped_value=$(echo "$value" | sed 's/"/\\"/g')
+      SECRET_VAR_ITEMS+="\"$key\":\"$escaped_value\""
+    done < "$SECRET_KEYS_FILE" 3< "$SECRET_VALUES_FILE"
+    SECRET_VALUES_VAR="-var=secret_values={$SECRET_VAR_ITEMS}"
+  fi
+
   # Import existing resources created by bootstrap
   log_info "Importing existing resources into Terraform state..."
 
@@ -1602,12 +1538,29 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
   if gcloud artifacts repositories describe "$REGISTRY_NAME" --location="$REGION" &>/dev/null; then
     if ! terraform state show "module.artifact_registry.google_artifact_registry_repository.main" &>/dev/null; then
       log_info "Importing existing Artifact Registry: $REGISTRY_NAME"
-      terraform import -var-file=terraform.tfvars \
+      terraform import -var-file=terraform.tfvars $SECRET_VALUES_VAR \
         "module.artifact_registry.google_artifact_registry_repository.main" \
         "projects/$PROJECT_ID/locations/$REGION/repositories/$REGISTRY_NAME"
     else
       log_success "Artifact Registry already in Terraform state"
     fi
+  fi
+
+  # Delete existing secrets that are not in Terraform state (Terraform will recreate them)
+  if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+    log_info "Checking for orphan secrets to clean up..."
+    while IFS= read -r key; do
+      secret_name="${SERVICE_NAME}-$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+      if gcloud secrets describe "$secret_name" &>/dev/null; then
+        if ! terraform state show "google_secret_manager_secret.secrets[\"$key\"]" &>/dev/null 2>&1; then
+          log_warn "Secret $secret_name exists in GCP but not in Terraform state"
+          log_info "Deleting orphan secret: $secret_name (Terraform will recreate it)"
+          gcloud secrets delete "$secret_name" --quiet || log_warn "Failed to delete $secret_name"
+        else
+          log_success "Secret $secret_name already managed by Terraform"
+        fi
+      fi
+    done < "$SECRET_KEYS_FILE"
   fi
 
   # Handle existing Domain Mapping (prevents 20min hang on create)
@@ -1620,7 +1573,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
           log_success "Domain Mapping deleted, Terraform will recreate it"
         else
           log_warn "Could not delete domain mapping, attempting import..."
-          terraform import -var-file=terraform.tfvars \
+          terraform import -var-file=terraform.tfvars $SECRET_VALUES_VAR \
             'module.cloud_run.google_cloud_run_domain_mapping.main[0]' \
             "locations/$REGION/namespaces/$PROJECT_ID/domainmappings/$CUSTOM_DOMAIN" || \
             log_warn "Import failed, Terraform may hang on apply"
@@ -1632,7 +1585,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
   fi
 
   log_info "Terraform plan..."
-  terraform plan -var-file=terraform.tfvars -out=tfplan
+  terraform plan -var-file=terraform.tfvars $SECRET_VALUES_VAR -out=tfplan
 
   echo ""
   APPLY_PLAN="false"
@@ -1658,7 +1611,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
       if echo "$output" | grep -q "${SERVICE_NAME}-run already exists"; then
         if ! terraform state show 'module.cloud_run.google_service_account.cloud_run' &>/dev/null; then
           log_info "Importing existing Cloud Run Service Account..."
-          if terraform import -var-file=terraform.tfvars \
+          if terraform import -var-file=terraform.tfvars $SECRET_VALUES_VAR \
             'module.cloud_run.google_service_account.cloud_run' \
             "projects/$PROJECT_ID/serviceAccounts/${SERVICE_NAME}-run@${PROJECT_ID}.iam.gserviceaccount.com" 2>/dev/null; then
             log_success "Cloud Run Service Account imported"
@@ -1673,7 +1626,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
       if echo "$output" | grep -q "github-actions already exists"; then
         if ! terraform state show 'module.workload_identity.google_service_account.github_actions' &>/dev/null; then
           log_info "Importing existing GitHub Actions Service Account..."
-          if terraform import -var-file=terraform.tfvars \
+          if terraform import -var-file=terraform.tfvars $SECRET_VALUES_VAR \
             'module.workload_identity.google_service_account.github_actions' \
             "projects/$PROJECT_ID/serviceAccounts/github-actions@${PROJECT_ID}.iam.gserviceaccount.com" 2>/dev/null; then
             log_success "GitHub Actions Service Account imported"
@@ -1688,7 +1641,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
       if echo "$output" | grep -q "WorkloadIdentityPool.*already exists\|workload_identity_pool.*already exists"; then
         if ! terraform state show 'module.workload_identity.google_iam_workload_identity_pool.github' &>/dev/null; then
           log_info "Importing existing Workload Identity Pool..."
-          if terraform import -var-file=terraform.tfvars \
+          if terraform import -var-file=terraform.tfvars $SECRET_VALUES_VAR \
             'module.workload_identity.google_iam_workload_identity_pool.github' \
             "projects/$PROJECT_ID/locations/global/workloadIdentityPools/github-pool" 2>/dev/null; then
             log_success "Workload Identity Pool imported"
@@ -1703,7 +1656,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
       if echo "$output" | grep -q "WorkloadIdentityPoolProvider.*already exists\|workload_identity_pool_provider.*already exists"; then
         if ! terraform state show 'module.workload_identity.google_iam_workload_identity_pool_provider.github' &>/dev/null; then
           log_info "Importing existing Workload Identity Provider..."
-          if terraform import -var-file=terraform.tfvars \
+          if terraform import -var-file=terraform.tfvars $SECRET_VALUES_VAR \
             'module.workload_identity.google_iam_workload_identity_pool_provider.github' \
             "projects/$PROJECT_ID/locations/global/workloadIdentityPools/github-pool/providers/github-provider" 2>/dev/null; then
             log_success "Workload Identity Provider imported"
@@ -1724,7 +1677,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
           fi
           if [[ -n "$domain_to_import" ]]; then
             log_info "Importing existing Domain Mapping: $domain_to_import"
-            if terraform import -var-file=terraform.tfvars \
+            if terraform import -var-file=terraform.tfvars $SECRET_VALUES_VAR \
               'module.cloud_run.google_cloud_run_domain_mapping.main[0]' \
               "locations/$REGION/namespaces/$PROJECT_ID/domainmappings/$domain_to_import"; then
               log_success "Domain Mapping imported"
@@ -1765,7 +1718,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
 
           if [[ "$imported" == "true" ]]; then
             log_success "Resources imported. Regenerating plan..."
-            terraform plan -var-file=terraform.tfvars -out=tfplan
+            terraform plan -var-file=terraform.tfvars $SECRET_VALUES_VAR -out=tfplan
             ((retry_count++))
             continue
           fi
@@ -1779,7 +1732,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
             log_warn "IAM permission error detected (attempt $retry_count/$max_retries). Waiting 30s for propagation..."
             sleep 30
             log_info "Retrying terraform apply..."
-            terraform plan -var-file=terraform.tfvars -out=tfplan
+            terraform plan -var-file=terraform.tfvars $SECRET_VALUES_VAR -out=tfplan
           fi
         else
           # Non-retryable error
@@ -1858,6 +1811,15 @@ if command -v gh &> /dev/null; then
         done < "$BUILD_KEYS_FILE" 3< "$BUILD_VALUES_FILE"
       fi
 
+      # Set secrets for Terraform (APP_KEY, DB_PASSWORD, etc)
+      if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+        log_info "Creating GitHub Secrets for Terraform-managed secrets..."
+        while IFS= read -r key && IFS= read -r value <&3; do
+          echo "$value" | gh secret set "$key" --repo="$GITHUB_REPO" --env=Production
+          log_success "Set secret: $key"
+        done < "$SECRET_KEYS_FILE" 3< "$SECRET_VALUES_FILE"
+      fi
+
       log_success "GitHub secrets and variables configured in 'Production' environment!"
     else
       log_warn "Skipped GitHub secrets configuration"
@@ -1876,6 +1838,7 @@ if [[ -z "$WIP" ]] || ! command -v gh &> /dev/null; then
   echo ""
   echo "┌────────────────────────────────────────────────────────────────────┐"
   echo "│ Repository Settings → Secrets and variables → Actions             │"
+  echo "│ Environment: Production                                            │"
   echo "├────────────────────────────────────────────────────────────────────┤"
   echo "│                                                                    │"
   echo "│ GCP_WORKLOAD_IDENTITY_PROVIDER:                                    │"
@@ -1891,8 +1854,13 @@ if [[ -z "$WIP" ]] || ! command -v gh &> /dev/null; then
   else
     echo "│ (run terraform apply first)"
   fi
-  echo "│                                                                    │"
-  echo "│ Note: terraform.tfvars is committed to the repo (no secret needed) │"
+  if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+    echo "│                                                                    │"
+    echo "│ Terraform-managed secrets (from .env):                             │"
+    while IFS= read -r key; do
+      echo "│   • $key"
+    done < "$SECRET_KEYS_FILE"
+  fi
   echo "│                                                                    │"
   echo "└────────────────────────────────────────────────────────────────────┘"
 fi
@@ -1954,9 +1922,8 @@ echo "    ├── terraform.tfvars"
 echo "    ├── terraform.tfvars.example"
 echo "    └── .gitignore"
 echo "  $WORKFLOWS_DIR/"
-echo "    ├── ci.yml              (build - always runs on PR)"
-echo "    ├── ci-terraform.yml    (terraform plan - skips if no infra changes)"
-echo "    └── cd.yml              (build + terraform apply - always runs on push)"
+echo "    ├── ci.yml              (build + terraform plan - runs on PR)"
+echo "    └── cd.yml              (build + terraform apply - runs on push to main)"
 echo ""
 echo "Next steps:"
 echo "  1. Review generated files"
