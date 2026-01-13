@@ -36,11 +36,11 @@ variable "delete_untagged" {
 variable "keep_recent_count" {
   description = "Number of recent images to keep (0 to disable)"
   type        = number
-  default     = 2
+  default     = 1
 }
 
-variable "delete_older_than_days" {
-  description = "Delete tagged images older than N days (0 to disable)"
+variable "delete_older_than_hours" {
+  description = "Delete tagged images older than N hours (0 to disable)"
   type        = number
   default     = 1
 }
