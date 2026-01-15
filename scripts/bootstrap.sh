@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Disable AWS CLI pager
+export AWS_PAGER=""
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -133,6 +136,30 @@ while [[ $# -gt 0 ]]; do
       CERTIFICATE_ARN="${1#*=}"
       shift
       ;;
+    --fargate-public-ip)
+      FARGATE_PUBLIC_IP=true
+      shift
+      ;;
+    --create-rds)
+      CREATE_RDS=true
+      shift
+      ;;
+    --rds-database=*)
+      RDS_DATABASE="${1#*=}"
+      shift
+      ;;
+    --rds-username=*)
+      RDS_USERNAME="${1#*=}"
+      shift
+      ;;
+    --rds-password=*)
+      RDS_PASSWORD="${1#*=}"
+      shift
+      ;;
+    --org-name=*)
+      ORG_NAME="${1#*=}"
+      shift
+      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
@@ -163,6 +190,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --vpc-subnetwork=NAME      VPC subnetwork for Direct VPC Egress"
       echo ""
       echo "AWS Options:"
+      echo "  --org-name=NAME            Organization name for bucket naming (e.g., codesumn)"
       echo "  --aws-account-id=ID        AWS Account ID (auto-detected if not provided)"
       echo "  --region=REGION            AWS Region (default: us-east-1)"
       echo "  --vpc-id=ID                VPC ID for ECS deployment (required for AWS)"
@@ -171,6 +199,11 @@ while [[ $# -gt 0 ]]; do
       echo "  --rds-instance=ENDPOINT    RDS endpoint for database connection (optional)"
       echo "  --certificate-arn=ARN      ACM certificate ARN for HTTPS (optional)"
       echo "  --storage-bucket=NAME      S3 bucket name for application storage"
+      echo "  --fargate-public-ip        Assign public IP to Fargate tasks (for outbound internet access)"
+      echo "  --create-rds               Create RDS PostgreSQL instance"
+      echo "  --rds-database=NAME        Database name (default: from env DB_DATABASE or 'app')"
+      echo "  --rds-username=USER        Database username (default: from env DB_USERNAME or 'postgres')"
+      echo "  --rds-password=PASS        Database password (default: from env DB_PASSWORD)"
       echo ""
       echo "Project types:"
       echo "  nodejs       - Node.js project (yarn/npm build before Docker)"
@@ -367,11 +400,18 @@ if [[ "$PROVIDER" == "aws" ]]; then
     log_success "Auto-detected AWS Account ID: $AWS_ACCOUNT_ID"
   fi
 
-  # Set state bucket name for AWS
-  STATE_BUCKET="${TF_STATE_BUCKET:-${SERVICE_NAME}-${AWS_ACCOUNT_ID}-tfstate}"
+  # Set state bucket name for AWS (prefer org-name over account ID)
+  if [[ -n "$ORG_NAME" ]]; then
+    STATE_BUCKET="${TF_STATE_BUCKET:-${SERVICE_NAME}-${ORG_NAME}-tfstate}"
+  else
+    STATE_BUCKET="${TF_STATE_BUCKET:-${SERVICE_NAME}-${AWS_ACCOUNT_ID}-tfstate}"
+  fi
 
   echo ""
   echo "  AWS Account ID:   $AWS_ACCOUNT_ID"
+  if [[ -n "$ORG_NAME" ]]; then
+    echo "  Org Name:         $ORG_NAME"
+  fi
   echo "  State Bucket:     $STATE_BUCKET"
   echo ""
 
@@ -402,6 +442,145 @@ if [[ "$PROVIDER" == "aws" ]]; then
       --public-access-block-configuration 'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
 
     log_success "S3 bucket created with versioning and encryption"
+  fi
+
+  # Create ACM certificate if custom domain is provided but no certificate ARN
+  if [[ -n "$CUSTOM_DOMAIN" && -z "$CERTIFICATE_ARN" ]]; then
+    print_header "Step 2.5: Creating ACM Certificate"
+
+    # Check if certificate already exists for this domain
+    EXISTING_CERT=$(aws acm list-certificates --region "$REGION" \
+      --query "CertificateSummaryList[?DomainName=='$CUSTOM_DOMAIN'].CertificateArn" \
+      --output text 2>/dev/null || echo "")
+
+    if [[ -n "$EXISTING_CERT" && "$EXISTING_CERT" != "None" ]]; then
+      CERTIFICATE_ARN="$EXISTING_CERT"
+      log_success "Found existing certificate: $CERTIFICATE_ARN"
+
+      # Check if it's issued
+      CERT_STATUS=$(aws acm describe-certificate --certificate-arn "$CERTIFICATE_ARN" --region "$REGION" \
+        --query 'Certificate.Status' --output text)
+
+      if [[ "$CERT_STATUS" == "ISSUED" ]]; then
+        log_success "Certificate is already issued and valid"
+      elif [[ "$CERT_STATUS" == "PENDING_VALIDATION" ]]; then
+        log_warn "Certificate is pending validation"
+      fi
+    else
+      log_info "Requesting new ACM certificate for: $CUSTOM_DOMAIN"
+
+      # Request certificate
+      CERTIFICATE_ARN=$(aws acm request-certificate \
+        --domain-name "$CUSTOM_DOMAIN" \
+        --validation-method DNS \
+        --region "$REGION" \
+        --query 'CertificateArn' \
+        --output text)
+
+      log_success "Certificate requested: $CERTIFICATE_ARN"
+
+      # Wait a moment for AWS to generate validation records
+      sleep 5
+    fi
+
+    # Get validation record
+    CERT_STATUS=$(aws acm describe-certificate --certificate-arn "$CERTIFICATE_ARN" --region "$REGION" \
+      --query 'Certificate.Status' --output text)
+
+    if [[ "$CERT_STATUS" != "ISSUED" ]]; then
+      log_info "Getting DNS validation record..."
+
+      VALIDATION_RECORD=$(aws acm describe-certificate \
+        --certificate-arn "$CERTIFICATE_ARN" \
+        --region "$REGION" \
+        --query 'Certificate.DomainValidationOptions[0].ResourceRecord' \
+        --output json 2>/dev/null || echo "{}")
+
+      VALIDATION_NAME=$(echo "$VALIDATION_RECORD" | grep -o '"Name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+      VALIDATION_VALUE=$(echo "$VALIDATION_RECORD" | grep -o '"Value"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+
+      if [[ -n "$VALIDATION_NAME" && -n "$VALIDATION_VALUE" ]]; then
+        echo ""
+        echo "┌────────────────────────────────────────────────────────────────────┐"
+        echo "│  Add this DNS record to validate your certificate:                 │"
+        echo "├────────────────────────────────────────────────────────────────────┤"
+        echo "│                                                                    │"
+        echo "│  Type:   CNAME                                                     │"
+        echo "│  Name:   $VALIDATION_NAME"
+        echo "│  Value:  $VALIDATION_VALUE"
+        echo "│                                                                    │"
+        echo "│  Add this record in your DNS provider (Cloudflare, Route53, etc.) │"
+        echo "│                                                                    │"
+        echo "└────────────────────────────────────────────────────────────────────┘"
+        echo ""
+
+        # Check if running interactively (terminal) or non-interactively (web app/CI)
+        WAIT_FOR_CERT="false"
+
+        if [[ -t 0 ]]; then
+          # Interactive mode - ask user if they want to wait
+          if [[ "$AUTO_APPROVE" != "true" ]]; then
+            read -p "Wait for certificate validation? (y/n) " -n 1 -r < /dev/tty
+            echo ""
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+              WAIT_FOR_CERT="true"
+            fi
+          fi
+        else
+          # Non-interactive mode (web app) - don't wait
+          log_info "Non-interactive mode: skipping certificate validation wait"
+        fi
+
+        if [[ "$WAIT_FOR_CERT" == "true" ]]; then
+          log_info "Waiting for certificate validation (this may take 1-5 minutes)..."
+
+          WAIT_TIME=0
+          MAX_WAIT=300  # 5 minutes
+
+          while [[ $WAIT_TIME -lt $MAX_WAIT ]]; do
+            CERT_STATUS=$(aws acm describe-certificate --certificate-arn "$CERTIFICATE_ARN" --region "$REGION" \
+              --query 'Certificate.Status' --output text)
+
+            if [[ "$CERT_STATUS" == "ISSUED" ]]; then
+              log_success "Certificate validated and issued!"
+              break
+            elif [[ "$CERT_STATUS" == "FAILED" ]]; then
+              log_error "Certificate validation failed"
+              exit 1
+            fi
+
+            echo -n "."
+            sleep 10
+            WAIT_TIME=$((WAIT_TIME + 10))
+          done
+          echo ""
+        fi
+
+        # Check final status
+        CERT_STATUS=$(aws acm describe-certificate --certificate-arn "$CERTIFICATE_ARN" --region "$REGION" \
+          --query 'Certificate.Status' --output text)
+
+        if [[ "$CERT_STATUS" != "ISSUED" ]]; then
+          log_warn "Certificate not yet validated (status: $CERT_STATUS)"
+          log_info "Continuing with HTTP only. HTTPS will be enabled after validation."
+          log_info ""
+          log_info "After adding the DNS record and validation completes, run:"
+          log_info "  cd $INFRA_DIR && terraform apply -var-file=terraform.tfvars"
+          log_info ""
+          log_info "Check certificate status:"
+          log_info "  aws acm describe-certificate --certificate-arn $CERTIFICATE_ARN --region $REGION --query 'Certificate.Status'"
+          # Clear certificate ARN so ALB is created with HTTP only
+          CERTIFICATE_ARN=""
+        fi
+      else
+        log_warn "Could not retrieve validation record. Check AWS console."
+        CERTIFICATE_ARN=""
+      fi
+    fi
+
+    if [[ -n "$CERTIFICATE_ARN" ]]; then
+      log_success "Certificate ARN: $CERTIFICATE_ARN"
+    fi
   fi
 
   # Create ECR repository and push initial image
@@ -778,8 +957,15 @@ secret_keys = [$(if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]
   done < "$SECRET_KEYS_FILE"
 fi)]
 
-certificate_arn = "${CERTIFICATE_ARN:-}"
-s3_bucket_arns  = [$(if [[ -n "$STORAGE_BUCKET" ]]; then echo "\"arn:aws:s3:::$STORAGE_BUCKET\", \"arn:aws:s3:::$STORAGE_BUCKET/*\""; fi)]
+certificate_arn   = "${CERTIFICATE_ARN:-}"
+s3_bucket_arns    = [$(if [[ -n "$STORAGE_BUCKET" ]]; then echo "\"arn:aws:s3:::$STORAGE_BUCKET\", \"arn:aws:s3:::$STORAGE_BUCKET/*\""; fi)]
+assign_public_ip  = $(if [[ "$FARGATE_PUBLIC_IP" == "true" ]]; then echo "true"; else echo "false"; fi)
+
+# RDS PostgreSQL (db.t4g.micro ~\$13/month)
+create_rds        = $(if [[ "$CREATE_RDS" == "true" ]]; then echo "true"; else echo "false"; fi)
+rds_database_name = "${RDS_DATABASE:-${DB_DATABASE:-app}}"
+rds_username      = "${RDS_USERNAME:-${DB_USERNAME:-postgres}}"
+rds_password      = "${RDS_PASSWORD:-${DB_PASSWORD:-}}"
 EOF
   log_success "Created infra/aws/terraform.tfvars"
 
@@ -823,11 +1009,10 @@ module "oidc_provider" {
   role_name   = "github-actions-\${var.service_name}"
   github_repo = var.github_repo
 
-  policy_arns = [
-    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser",
-    "arn:aws:iam::aws:policy/AmazonECS_FullAccess",
-    "arn:aws:iam::aws:policy/SecretsManagerReadWrite",
-  ]
+  enable_ecs_access             = true
+  enable_secrets_manager_access = true
+  enable_s3_access              = true
+  terraform_state_bucket        = "$STATE_BUCKET"
 }
 
 module "ecr" {
@@ -838,6 +1023,46 @@ module "ecr" {
   scan_on_push         = true
   force_delete         = true
   keep_image_count     = 10
+}
+
+# VPC data for CIDR block
+data "aws_vpc" "main" {
+  id = var.vpc_id
+}
+
+# RDS PostgreSQL (economical config - private subnet only)
+module "rds_postgres" {
+  count  = var.create_rds ? 1 : 0
+  source = "github.com/$TERRAFORM_MODULES_REPO//modules/aws/rds-postgres?ref=main"
+
+  identifier    = "rds-\${var.service_name}"
+  vpc_id        = var.vpc_id
+  subnet_ids    = var.private_subnet_ids
+  database_name = var.rds_database_name
+  username      = var.rds_username
+  password      = var.rds_password
+
+  # Economical settings (db.t4g.micro ~\$13/month)
+  instance_class        = "db.t4g.micro"
+  allocated_storage     = 20
+  max_allocated_storage = 100
+  storage_type          = "gp3"
+  multi_az              = false
+
+  # Private network only
+  publicly_accessible = false
+
+  # Allow connections from VPC CIDR (ECS tasks)
+  allowed_cidr_blocks = [data.aws_vpc.main.cidr_block]
+
+  # Backup & maintenance
+  backup_retention_period = 7
+  deletion_protection     = false
+  skip_final_snapshot     = true
+
+  tags = {
+    Service = var.service_name
+  }
 }
 
 # Secrets Manager - Terraform managed secrets with service prefix
@@ -861,6 +1086,15 @@ resource "aws_secretsmanager_secret_version" "secrets" {
   }
 }
 
+# Merge RDS endpoint into env_vars when RDS is created
+locals {
+  rds_env_vars = var.create_rds ? {
+    DB_HOST = module.rds_postgres[0].address
+    DB_PORT = tostring(module.rds_postgres[0].port)
+  } : {}
+  final_env_vars = merge(var.env_vars, local.rds_env_vars)
+}
+
 module "ecs_fargate" {
   source = "github.com/$TERRAFORM_MODULES_REPO//modules/aws/ecs-fargate?ref=main"
 
@@ -881,7 +1115,7 @@ module "ecs_fargate" {
   min_count     = var.ecs_min_count
   max_count     = var.ecs_max_count
 
-  env_vars = var.env_vars
+  env_vars = local.final_env_vars
 
   secret_env_vars = {
     for name in var.secret_keys : name => aws_secretsmanager_secret.secrets[name].arn
@@ -892,8 +1126,9 @@ module "ecs_fargate" {
 
   certificate_arn     = var.certificate_arn
   deletion_protection = var.deletion_protection
+  assign_public_ip    = var.assign_public_ip
 
-  depends_on = [module.ecr, aws_secretsmanager_secret_version.secrets]
+  depends_on = [module.ecr, module.rds_postgres, aws_secretsmanager_secret_version.secrets]
 }
 EOF
   log_success "Created infra/aws/main.tf"
@@ -1015,6 +1250,38 @@ variable "deletion_protection" {
   type        = bool
   default     = false
 }
+
+variable "assign_public_ip" {
+  description = "Assign public IP to Fargate tasks (for outbound internet access without NAT)"
+  type        = bool
+  default     = false
+}
+
+# RDS Variables
+variable "create_rds" {
+  description = "Create RDS PostgreSQL instance"
+  type        = bool
+  default     = false
+}
+
+variable "rds_database_name" {
+  description = "Database name"
+  type        = string
+  default     = "app"
+}
+
+variable "rds_username" {
+  description = "Database master username"
+  type        = string
+  default     = "postgres"
+}
+
+variable "rds_password" {
+  description = "Database master password"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
 EOF
   log_success "Created infra/aws/variables.tf"
 
@@ -1048,6 +1315,22 @@ output "ecs_cluster_name" {
 output "ecs_service_name" {
   description = "ECS service name"
   value       = module.ecs_fargate.service_name
+}
+
+# RDS outputs (only when create_rds = true)
+output "rds_endpoint" {
+  description = "RDS endpoint (host:port)"
+  value       = var.create_rds ? module.rds_postgres[0].endpoint : null
+}
+
+output "rds_address" {
+  description = "RDS hostname"
+  value       = var.create_rds ? module.rds_postgres[0].address : null
+}
+
+output "rds_database_name" {
+  description = "RDS database name"
+  value       = var.create_rds ? module.rds_postgres[0].database_name : null
 }
 EOF
   log_success "Created infra/aws/outputs.tf"
@@ -1083,7 +1366,7 @@ EOF
           cache: yarn
 
       - name: Cache Next.js build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: \${{ github.workspace }}/.next/cache
           key: \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-\${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx', '**/*.css', '**/*.scss') }}
@@ -1101,7 +1384,7 @@ EOF
       ;;
     java-maven)
       CI_BUILD_STEPS="      - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -1113,7 +1396,7 @@ EOF
       ;;
     java-gradle)
       CI_BUILD_STEPS="      - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -1136,7 +1419,7 @@ EOF
         run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
 
       - name: Cache Composer dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: \${{ steps.composer-cache.outputs.dir }}
           key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
@@ -1172,7 +1455,7 @@ EOF
         run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
 
       - name: Cache Composer dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: \${{ steps.composer-cache.outputs.dir }}
           key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
@@ -1321,7 +1604,7 @@ $(echo -e "$CD_BUILD_ENV_VARS")
     java-maven)
       CD_BUILD_STEPS="
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -1334,7 +1617,7 @@ $(echo -e "$CD_BUILD_ENV_VARS")
     java-gradle)
       CD_BUILD_STEPS="
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -1397,7 +1680,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: \${{ secrets.AWS_ROLE_ARN }}
           aws-region: \${{ env.REGION }}
@@ -2553,7 +2836,7 @@ case "$PROJECT_TYPE" in
           cache: yarn
 
       - name: Cache Next.js build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: \${{ github.workspace }}/.next/cache
           key: \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-\${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx', '**/*.css', '**/*.scss') }}
@@ -2571,7 +2854,7 @@ case "$PROJECT_TYPE" in
     ;;
   java-maven)
     CI_BUILD_STEPS="      - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -2583,7 +2866,7 @@ case "$PROJECT_TYPE" in
     ;;
   java-gradle)
     CI_BUILD_STEPS="      - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -2606,7 +2889,7 @@ case "$PROJECT_TYPE" in
         run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
 
       - name: Cache Composer dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: \${{ steps.composer-cache.outputs.dir }}
           key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
@@ -2642,7 +2925,7 @@ case "$PROJECT_TYPE" in
         run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
 
       - name: Cache Composer dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: \${{ steps.composer-cache.outputs.dir }}
           key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
@@ -2810,7 +3093,7 @@ case "$PROJECT_TYPE" in
           cache: yarn
 
       - name: Cache Next.js build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: \${{ github.workspace }}/.next/cache
           key: \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-\${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx', '**/*.css', '**/*.scss') }}
@@ -2840,7 +3123,7 @@ $(echo -e "$CD_BUILD_ENV_VARS")
         run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
 
       - name: Cache Composer dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: \${{ steps.composer-cache.outputs.dir }}
           key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
@@ -2864,7 +3147,7 @@ $(echo -e "$CD_BUILD_ENV_VARS")
         run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
 
       - name: Cache Composer dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: \${{ steps.composer-cache.outputs.dir }}
           key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
@@ -2892,7 +3175,7 @@ $(echo -e "$CD_BUILD_ENV_VARS")
   java-maven)
     CD_BUILD_STEPS="
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -2905,7 +3188,7 @@ $(echo -e "$CD_BUILD_ENV_VARS")
   java-gradle)
     CD_BUILD_STEPS="
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
