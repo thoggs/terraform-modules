@@ -159,3 +159,21 @@ variable "storage_buckets" {
   type        = list(string)
   default     = []
 }
+
+variable "vpc_network" {
+  description = "VPC network name for Direct VPC Egress (e.g., 'projects/PROJECT/global/networks/NETWORK' or just 'NETWORK')"
+  type        = string
+  default     = ""
+}
+
+variable "vpc_subnetwork" {
+  description = "VPC subnetwork name for Direct VPC Egress (e.g., 'projects/PROJECT/regions/REGION/subnetworks/SUBNET' or just 'SUBNET')"
+  type        = string
+  default     = ""
+}
+
+variable "vpc_egress" {
+  description = "VPC egress setting: ALL_TRAFFIC or PRIVATE_RANGES_ONLY (default, recommended for performance)"
+  type        = string
+  default     = "PRIVATE_RANGES_ONLY"
+}
