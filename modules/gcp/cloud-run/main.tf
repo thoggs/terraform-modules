@@ -88,6 +88,18 @@ resource "google_cloud_run_v2_service" "main" {
     }
 
     timeout = var.timeout
+
+    dynamic "vpc_access" {
+      for_each = var.vpc_network != "" && var.vpc_subnetwork != "" ? [1] : []
+      content {
+        egress = var.vpc_egress
+
+        network_interfaces {
+          network    = var.vpc_network
+          subnetwork = var.vpc_subnetwork
+        }
+      }
+    }
   }
 
   traffic {
