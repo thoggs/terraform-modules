@@ -47,3 +47,8 @@ output "connection_string" {
   description = "PostgreSQL connection string (without password)"
   value       = "postgresql://${aws_db_instance.main.username}@${aws_db_instance.main.endpoint}/${aws_db_instance.main.db_name}"
 }
+
+output "master_user_secret_arn" {
+  description = "ARN of the Secrets Manager secret containing the master password (when using manage_master_user_password)"
+  value       = try(aws_db_instance.main.master_user_secret[0].secret_arn, null)
+}
