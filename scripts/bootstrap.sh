@@ -101,6 +101,14 @@ while [[ $# -gt 0 ]]; do
       TF_STATE_BUCKET="${1#*=}"
       shift
       ;;
+    --vpc-network=*)
+      VPC_NETWORK="${1#*=}"
+      shift
+      ;;
+    --vpc-subnetwork=*)
+      VPC_SUBNETWORK="${1#*=}"
+      shift
+      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
@@ -124,6 +132,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --health-check-path=PATH   Health check endpoint (default: /api/health for nodejs, /up for laravel)"
       echo "  --registry-name=NAME       Artifact Registry name (default: same as service-name)"
       echo "  --tf-state-bucket=NAME     GCS bucket name for Terraform state (default: {project-id}-tfstate)"
+      echo "  --vpc-network=NAME         VPC network for Direct VPC Egress (e.g., 'default' or 'projects/PROJECT/global/networks/NETWORK')"
+      echo "  --vpc-subnetwork=NAME      VPC subnetwork for Direct VPC Egress (e.g., 'default' or 'projects/PROJECT/regions/REGION/subnetworks/SUBNET')"
       echo "  --help                     Show this help"
       echo ""
       echo "Project types:"
@@ -249,6 +259,10 @@ echo "  Project Type:     $PROJECT_TYPE"
 if [[ -n "$CUSTOM_DOMAIN" ]]; then
   echo "  Custom Domain:    $CUSTOM_DOMAIN"
 fi
+if [[ -n "$VPC_NETWORK" && -n "$VPC_SUBNETWORK" ]]; then
+  echo "  VPC Network:      $VPC_NETWORK (Direct VPC Egress)"
+  echo "  VPC Subnetwork:   $VPC_SUBNETWORK"
+fi
 echo ""
 
 # Check gcloud auth
@@ -307,6 +321,7 @@ APIS=(
   "iamcredentials.googleapis.com"
   "cloudresourcemanager.googleapis.com"
   "sqladmin.googleapis.com"
+  "compute.googleapis.com"
 )
 
 for api in "${APIS[@]}"; do
@@ -729,6 +744,9 @@ storage_buckets = [$(if [[ -n "$STORAGE_BUCKET" ]]; then echo "\"$STORAGE_BUCKET
 
 container_port    = $CONTAINER_PORT
 health_check_path = "$HEALTH_CHECK_PATH"
+
+vpc_network    = "${VPC_NETWORK:-}"
+vpc_subnetwork = "${VPC_SUBNETWORK:-}"
 EOF
 log_success "Created infra/gcp/terraform.tfvars"
 
@@ -840,6 +858,9 @@ module "cloud_run" {
 
   cloudsql_instances = var.cloudsql_instance != "" ? [var.cloudsql_instance] : []
   storage_buckets    = var.storage_buckets
+
+  vpc_network    = var.vpc_network
+  vpc_subnetwork = var.vpc_subnetwork
 
   depends_on = [module.artifact_registry, google_secret_manager_secret_version.secrets]
 }
@@ -984,6 +1005,18 @@ variable "registry_delete_older_than_hours" {
   description = "Delete Docker images older than N hours from Artifact Registry"
   type        = number
   default     = 1
+}
+
+variable "vpc_network" {
+  description = "VPC network name for Direct VPC Egress (e.g., 'default' or 'projects/PROJECT/global/networks/NETWORK')"
+  type        = string
+  default     = ""
+}
+
+variable "vpc_subnetwork" {
+  description = "VPC subnetwork name for Direct VPC Egress (e.g., 'default' or 'projects/PROJECT/regions/REGION/subnetworks/SUBNET')"
+  type        = string
+  default     = ""
 }
 EOF
 log_success "Created infra/gcp/variables.tf"
