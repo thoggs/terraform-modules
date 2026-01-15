@@ -783,9 +783,15 @@ if [[ "$PROVIDER" == "aws" ]]; then
           ((env_count++))
         fi
 
-        # Capture DB_DATABASE for RDS
+        # Capture DB_DATABASE, DB_USERNAME, DB_PASSWORD for RDS
         if [[ "$key" == "DB_DATABASE" ]]; then
           DB_DATABASE="$value"
+        fi
+        if [[ "$key" == "DB_USERNAME" ]]; then
+          DB_USERNAME="$value"
+        fi
+        if [[ "$key" == "DB_PASSWORD" ]]; then
+          DB_PASSWORD="$value"
         fi
 
         # Auto-detect S3 bucket from AWS_BUCKET
@@ -920,6 +926,40 @@ if [[ "$PROVIDER" == "aws" ]]; then
   PUBLIC_SUBNET_TF=$(echo "$PUBLIC_SUBNET_IDS" | sed 's/,/", "/g' | sed 's/^/"/; s/$/"/')
   PRIVATE_SUBNET_TF=$(echo "$PRIVATE_SUBNET_IDS" | sed 's/,/", "/g' | sed 's/^/"/; s/$/"/')
 
+  # Sanitize RDS password (AWS RDS doesn't allow: / @ " space)
+  FINAL_RDS_PASSWORD="${RDS_PASSWORD:-${DB_PASSWORD:-}}"
+  if [[ -n "$FINAL_RDS_PASSWORD" ]]; then
+    SANITIZED_PASSWORD=$(echo "$FINAL_RDS_PASSWORD" | tr -d '/@"\ ')
+    if [[ "$SANITIZED_PASSWORD" != "$FINAL_RDS_PASSWORD" ]]; then
+      log_warn "RDS password contained invalid characters (/ @ \" space) - they were removed"
+      FINAL_RDS_PASSWORD="$SANITIZED_PASSWORD"
+    fi
+  fi
+
+  # Generate random password if empty or if CREATE_RDS is enabled without password
+  if [[ "$CREATE_RDS" == "true" && -z "$FINAL_RDS_PASSWORD" ]]; then
+    log_info "Generating secure random password for RDS..."
+    FINAL_RDS_PASSWORD=$(LC_ALL=C tr -dc 'A-Za-z0-9!#$%^&*()_+-=[]{}|;:,.<>?' < /dev/urandom | head -c 32)
+    log_success "Random password generated (32 chars, alphanumeric + safe special chars)"
+  fi
+
+  # Update DB_PASSWORD in secrets file to match RDS password (if changed or generated)
+  if [[ "$CREATE_RDS" == "true" && -n "$FINAL_RDS_PASSWORD" && -f "$SECRET_KEYS_FILE" ]]; then
+    # Find DB_PASSWORD line number in secrets files
+    DB_PASS_LINE=$(grep -n "^DB_PASSWORD$" "$SECRET_KEYS_FILE" 2>/dev/null | cut -d: -f1 || echo "")
+    if [[ -n "$DB_PASS_LINE" ]]; then
+      # Update the password value in SECRET_VALUES_FILE
+      sed -i '' "${DB_PASS_LINE}s/.*/${FINAL_RDS_PASSWORD}/" "$SECRET_VALUES_FILE" 2>/dev/null || \
+        sed -i "${DB_PASS_LINE}s/.*/${FINAL_RDS_PASSWORD}/" "$SECRET_VALUES_FILE"
+      log_info "Updated DB_PASSWORD in secrets to match RDS password"
+    else
+      # DB_PASSWORD not in secrets, add it
+      echo "DB_PASSWORD" >> "$SECRET_KEYS_FILE"
+      echo "$FINAL_RDS_PASSWORD" >> "$SECRET_VALUES_FILE"
+      log_info "Added DB_PASSWORD to secrets"
+    fi
+  fi
+
   # Create terraform.tfvars for AWS
   cat > "$INFRA_DIR/terraform.tfvars" << EOF
 region           = "$REGION"
@@ -965,7 +1005,7 @@ assign_public_ip  = $(if [[ "$FARGATE_PUBLIC_IP" == "true" ]]; then echo "true";
 create_rds        = $(if [[ "$CREATE_RDS" == "true" ]]; then echo "true"; else echo "false"; fi)
 rds_database_name = "${RDS_DATABASE:-${DB_DATABASE:-app}}"
 rds_username      = "${RDS_USERNAME:-${DB_USERNAME:-postgres}}"
-rds_password      = "${RDS_PASSWORD:-${DB_PASSWORD:-}}"
+rds_password      = \"${FINAL_RDS_PASSWORD}\"
 EOF
   log_success "Created infra/aws/terraform.tfvars"
 
@@ -1739,6 +1779,13 @@ $(echo -e "$SECRET_ENV_BLOCK")
 
     log_info "Terraform init..."
     terraform init
+
+    # Import existing ECR repository if it exists
+    ECR_REPO_NAME="ecr-${SERVICE_NAME}"
+    if aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" --region "$REGION" &>/dev/null; then
+      log_info "ECR repository '$ECR_REPO_NAME' already exists, importing..."
+      terraform import -var-file=terraform.tfvars 'module.ecr.aws_ecr_repository.main' "$ECR_REPO_NAME" 2>/dev/null || true
+    fi
 
     # Build secret_values for local terraform commands
     SECRET_VALUES_VAR=""
