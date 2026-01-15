@@ -109,32 +109,68 @@ while [[ $# -gt 0 ]]; do
       VPC_SUBNETWORK="${1#*=}"
       shift
       ;;
+    --aws-account-id=*)
+      AWS_ACCOUNT_ID="${1#*=}"
+      shift
+      ;;
+    --vpc-id=*)
+      VPC_ID="${1#*=}"
+      shift
+      ;;
+    --public-subnet-ids=*)
+      PUBLIC_SUBNET_IDS="${1#*=}"
+      shift
+      ;;
+    --private-subnet-ids=*)
+      PRIVATE_SUBNET_IDS="${1#*=}"
+      shift
+      ;;
+    --rds-instance=*)
+      RDS_INSTANCE="${1#*=}"
+      shift
+      ;;
+    --certificate-arn=*)
+      CERTIFICATE_ARN="${1#*=}"
+      shift
+      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
-      echo "Options:"
-      echo "  --project-id=ID            GCP Project ID (required)"
-      echo "  --region=REGION            GCP Region (default: us-central1)"
+      echo "Common Options:"
+      echo "  --provider=PROVIDER        Cloud provider: gcp (default), aws"
       echo "  --service-name=NAME        Service name (required)"
       echo "  --github-repo=REPO         GitHub repo owner/repo (required)"
-      echo "  --billing-account=ID       Billing account ID (required if --create-project)"
       echo "  --terraform-modules-repo=REPO  Terraform modules repo (default: thoggs/terraform-modules)"
       echo "  --output-dir=PATH          Output directory for generated files (default: current dir)"
-      echo "  --create-project           Create new GCP project"
       echo "  --skip-terraform           Skip terraform init/plan/apply"
       echo "  --yes, -y                  Auto-approve all prompts (skip confirmations)"
-      echo "  --custom-domain=DOMAIN     Custom domain for Cloud Run (e.g., app.example.com)"
-      echo "  --provider=PROVIDER        Cloud provider: gcp (default), aws*, azure* (*coming soon)"
-      echo "  --env-file=PATH            Environment file to process (auto-detects .env.local)"
+      echo "  --env-file=PATH            Environment file to process (auto-detects .env.production)"
       echo "  --project-type=TYPE        Project type (required): nodejs, laravel-api, laravel-ssr, java-maven, java-gradle, docker-only"
-      echo "  --storage-bucket=NAME      GCS bucket name for application storage (Terraform grants objectAdmin to Cloud Run SA)"
       echo "  --container-port=PORT      Container port (default: 3000 for nodejs, 80 for laravel, 8080 for java)"
       echo "  --health-check-path=PATH   Health check endpoint (default: /api/health for nodejs, /up for laravel)"
-      echo "  --registry-name=NAME       Artifact Registry name (default: same as service-name)"
-      echo "  --tf-state-bucket=NAME     GCS bucket name for Terraform state (default: {project-id}-tfstate)"
-      echo "  --vpc-network=NAME         VPC network for Direct VPC Egress (e.g., 'default' or 'projects/PROJECT/global/networks/NETWORK')"
-      echo "  --vpc-subnetwork=NAME      VPC subnetwork for Direct VPC Egress (e.g., 'default' or 'projects/PROJECT/regions/REGION/subnetworks/SUBNET')"
+      echo "  --tf-state-bucket=NAME     Bucket name for Terraform state"
       echo "  --help                     Show this help"
+      echo ""
+      echo "GCP Options:"
+      echo "  --project-id=ID            GCP Project ID (required for GCP)"
+      echo "  --region=REGION            GCP Region (default: us-central1)"
+      echo "  --billing-account=ID       Billing account ID (required if --create-project)"
+      echo "  --create-project           Create new GCP project"
+      echo "  --custom-domain=DOMAIN     Custom domain for Cloud Run (e.g., app.example.com)"
+      echo "  --storage-bucket=NAME      GCS bucket name for application storage"
+      echo "  --registry-name=NAME       Artifact Registry name (default: same as service-name)"
+      echo "  --vpc-network=NAME         VPC network for Direct VPC Egress"
+      echo "  --vpc-subnetwork=NAME      VPC subnetwork for Direct VPC Egress"
+      echo ""
+      echo "AWS Options:"
+      echo "  --aws-account-id=ID        AWS Account ID (auto-detected if not provided)"
+      echo "  --region=REGION            AWS Region (default: us-east-1)"
+      echo "  --vpc-id=ID                VPC ID for ECS deployment (required for AWS)"
+      echo "  --public-subnet-ids=IDS    Comma-separated public subnet IDs for ALB (required for AWS)"
+      echo "  --private-subnet-ids=IDS   Comma-separated private subnet IDs for ECS tasks (required for AWS)"
+      echo "  --rds-instance=ENDPOINT    RDS endpoint for database connection (optional)"
+      echo "  --certificate-arn=ARN      ACM certificate ARN for HTTPS (optional)"
+      echo "  --storage-bucket=NAME      S3 bucket name for application storage"
       echo ""
       echo "Project types:"
       echo "  nodejs       - Node.js project (yarn/npm build before Docker)"
@@ -144,12 +180,24 @@ while [[ $# -gt 0 ]]; do
       echo "  java-gradle  - Java project with Gradle (./gradlew build before Docker)"
       echo "  docker-only  - Multi-stage Dockerfile handles everything"
       echo ""
-      echo "Example:"
+      echo "GCP Example:"
       echo "  ./bootstrap.sh \\"
+      echo "    --provider=gcp \\"
       echo "    --project-id=my-project \\"
       echo "    --service-name=my-app \\"
       echo "    --github-repo=myuser/my-app \\"
-      echo "    --project-type=nodejs \\"
+      echo "    --project-type=laravel-ssr \\"
+      echo "    --output-dir=/path/to/my-app"
+      echo ""
+      echo "AWS Example:"
+      echo "  ./bootstrap.sh \\"
+      echo "    --provider=aws \\"
+      echo "    --service-name=my-app \\"
+      echo "    --github-repo=myuser/my-app \\"
+      echo "    --project-type=laravel-ssr \\"
+      echo "    --vpc-id=vpc-0123456789abcdef0 \\"
+      echo "    --public-subnet-ids=subnet-abc123,subnet-def456 \\"
+      echo "    --private-subnet-ids=subnet-ghi789,subnet-jkl012 \\"
       echo "    --output-dir=/path/to/my-app"
       exit 0
       ;;
@@ -168,23 +216,26 @@ OUTPUT_DIR="${OUTPUT_DIR:-.}"
 REGISTRY_NAME="${REGISTRY_NAME:-$SERVICE_NAME}"
 
 # Validate provider
-if [[ "$PROVIDER" != "gcp" ]]; then
-  if [[ "$PROVIDER" == "aws" ]] || [[ "$PROVIDER" == "azure" ]]; then
-    log_error "Provider '$PROVIDER' is not implemented yet. Only 'gcp' is currently supported."
-    log_info "AWS and Azure support coming soon!"
+case "$PROVIDER" in
+  gcp|aws)
+    ;;
+  azure)
+    log_error "Provider '$PROVIDER' is not implemented yet."
+    log_info "Azure support coming soon!"
     exit 1
-  else
-    log_error "Unknown provider: $PROVIDER. Supported: gcp (aws and azure coming soon)"
+    ;;
+  *)
+    log_error "Unknown provider: $PROVIDER. Supported: gcp, aws"
     exit 1
-  fi
+    ;;
+esac
+
+# Set provider-specific defaults
+if [[ "$PROVIDER" == "aws" ]]; then
+  REGION="${REGION:-us-east-1}"
 fi
 
-# Validate required arguments
-if [[ -z "$PROJECT_ID" ]]; then
-  log_error "Missing required argument: --project-id"
-  exit 1
-fi
-
+# Validate common required arguments
 if [[ -z "$SERVICE_NAME" ]]; then
   log_error "Missing required argument: --service-name"
   exit 1
@@ -199,6 +250,27 @@ if [[ -z "$PROJECT_TYPE" ]]; then
   log_error "Missing required argument: --project-type"
   log_info "Options: nodejs, laravel-api, laravel-ssr, java-maven, java-gradle, docker-only"
   exit 1
+fi
+
+# Validate provider-specific required arguments
+if [[ "$PROVIDER" == "gcp" ]]; then
+  if [[ -z "$PROJECT_ID" ]]; then
+    log_error "Missing required argument: --project-id (required for GCP)"
+    exit 1
+  fi
+elif [[ "$PROVIDER" == "aws" ]]; then
+  if [[ -z "$VPC_ID" ]]; then
+    log_error "Missing required argument: --vpc-id (required for AWS)"
+    exit 1
+  fi
+  if [[ -z "$PUBLIC_SUBNET_IDS" ]]; then
+    log_error "Missing required argument: --public-subnet-ids (required for AWS)"
+    exit 1
+  fi
+  if [[ -z "$PRIVATE_SUBNET_IDS" ]]; then
+    log_error "Missing required argument: --private-subnet-ids (required for AWS)"
+    exit 1
+  fi
 fi
 
 case "$PROJECT_TYPE" in
@@ -236,12 +308,1405 @@ if [[ "$CREATE_PROJECT" == "true" && -z "$BILLING_ACCOUNT" ]]; then
   exit 1
 fi
 
-# Terraform state bucket name (custom or default: {project-id}-tfstate)
-STATE_BUCKET="${TF_STATE_BUCKET:-${PROJECT_ID}-tfstate}"
-
 # Directory paths
-INFRA_DIR="$OUTPUT_DIR/infra/gcp"
 WORKFLOWS_DIR="$OUTPUT_DIR/.github/workflows"
+
+# Provider-specific setup
+if [[ "$PROVIDER" == "gcp" ]]; then
+  STATE_BUCKET="${TF_STATE_BUCKET:-${PROJECT_ID}-tfstate}"
+  INFRA_DIR="$OUTPUT_DIR/infra/gcp"
+elif [[ "$PROVIDER" == "aws" ]]; then
+  INFRA_DIR="$OUTPUT_DIR/infra/aws"
+fi
+
+# ============================================================================
+# AWS PROVIDER FLOW
+# ============================================================================
+if [[ "$PROVIDER" == "aws" ]]; then
+  print_header "AWS ECS Fargate Bootstrap"
+
+  echo "Configuration:"
+  echo "  Provider:         $PROVIDER"
+  echo "  Region:           $REGION"
+  echo "  Service Name:     $SERVICE_NAME"
+  echo "  GitHub Repo:      $GITHUB_REPO"
+  echo "  Modules Repo:     $TERRAFORM_MODULES_REPO"
+  echo "  Output Dir:       $OUTPUT_DIR"
+  echo "  Project Type:     $PROJECT_TYPE"
+  echo "  VPC ID:           $VPC_ID"
+  echo "  Public Subnets:   $PUBLIC_SUBNET_IDS"
+  echo "  Private Subnets:  $PRIVATE_SUBNET_IDS"
+  if [[ -n "$RDS_INSTANCE" ]]; then
+    echo "  RDS Instance:     $RDS_INSTANCE"
+  fi
+  if [[ -n "$CUSTOM_DOMAIN" ]]; then
+    echo "  Custom Domain:    $CUSTOM_DOMAIN"
+  fi
+  if [[ -n "$CERTIFICATE_ARN" ]]; then
+    echo "  Certificate ARN:  $CERTIFICATE_ARN"
+  fi
+  if [[ -n "$STORAGE_BUCKET" ]]; then
+    echo "  S3 Bucket:        $STORAGE_BUCKET"
+  fi
+  echo ""
+
+  # Check AWS authentication
+  print_header "Step 1: Checking AWS Authentication"
+
+  if ! aws sts get-caller-identity &>/dev/null; then
+    log_error "Not authenticated to AWS. Please configure credentials:"
+    log_info "  aws configure"
+    log_info "  OR export AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+    exit 1
+  fi
+  log_success "AWS authenticated"
+
+  # Auto-detect AWS Account ID if not provided
+  if [[ -z "$AWS_ACCOUNT_ID" ]]; then
+    AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    log_success "Auto-detected AWS Account ID: $AWS_ACCOUNT_ID"
+  fi
+
+  # Set state bucket name for AWS
+  STATE_BUCKET="${TF_STATE_BUCKET:-${SERVICE_NAME}-${AWS_ACCOUNT_ID}-tfstate}"
+
+  echo ""
+  echo "  AWS Account ID:   $AWS_ACCOUNT_ID"
+  echo "  State Bucket:     $STATE_BUCKET"
+  echo ""
+
+  # Create S3 state bucket
+  print_header "Step 2: Creating Terraform State Bucket"
+
+  if aws s3api head-bucket --bucket "$STATE_BUCKET" 2>/dev/null; then
+    log_warn "Bucket $STATE_BUCKET already exists"
+  else
+    log_info "Creating S3 bucket: $STATE_BUCKET"
+    if [[ "$REGION" == "us-east-1" ]]; then
+      aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$REGION"
+    else
+      aws s3api create-bucket --bucket "$STATE_BUCKET" --region "$REGION" \
+        --create-bucket-configuration LocationConstraint="$REGION"
+    fi
+
+    # Enable versioning for state files
+    aws s3api put-bucket-versioning --bucket "$STATE_BUCKET" \
+      --versioning-configuration Status=Enabled
+
+    # Enable encryption
+    aws s3api put-bucket-encryption --bucket "$STATE_BUCKET" \
+      --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+    # Block public access
+    aws s3api put-public-access-block --bucket "$STATE_BUCKET" \
+      --public-access-block-configuration 'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+
+    log_success "S3 bucket created with versioning and encryption"
+  fi
+
+  # Create ECR repository and push initial image
+  print_header "Step 3: Creating ECR Repository & Pushing Initial Image"
+
+  ECR_REPO_NAME="ecr-${SERVICE_NAME}"
+  ECR_REPO_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}"
+
+  # Create ECR repository if it doesn't exist
+  if ! aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" --region "$REGION" &>/dev/null; then
+    log_info "Creating ECR repository: $ECR_REPO_NAME"
+    aws ecr create-repository \
+      --repository-name "$ECR_REPO_NAME" \
+      --region "$REGION" \
+      --image-scanning-configuration scanOnPush=true \
+      --encryption-configuration encryptionType=AES256
+    log_success "ECR repository created"
+
+    # Set lifecycle policy to keep only 10 images
+    log_info "Setting lifecycle policy..."
+    aws ecr put-lifecycle-policy \
+      --repository-name "$ECR_REPO_NAME" \
+      --region "$REGION" \
+      --lifecycle-policy-text '{
+        "rules": [
+          {
+            "rulePriority": 1,
+            "description": "Keep only 10 images",
+            "selection": {
+              "tagStatus": "any",
+              "countType": "imageCountMoreThan",
+              "countNumber": 10
+            },
+            "action": {
+              "type": "expire"
+            }
+          }
+        ]
+      }'
+    log_success "Lifecycle policy configured"
+  else
+    log_warn "ECR repository $ECR_REPO_NAME already exists"
+  fi
+
+  # Configure Docker authentication for ECR
+  log_info "Configuring Docker authentication for ECR..."
+  aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
+  log_success "Docker configured for ECR"
+
+  # Build and push initial image if Dockerfile exists
+  if [[ -f "$OUTPUT_DIR/Dockerfile" ]]; then
+    cd "$OUTPUT_DIR"
+    case "$PROJECT_TYPE" in
+      nodejs)
+        log_info "Building Node.js application..."
+        if command -v yarn &>/dev/null && [[ -f "yarn.lock" ]]; then
+          yarn install --immutable 2>/dev/null || yarn install
+          yarn build
+        elif command -v npm &>/dev/null; then
+          npm ci 2>/dev/null || npm install
+          npm run build
+        fi
+        log_success "Node.js application built"
+        ;;
+      laravel-api)
+        log_info "Building Laravel API application..."
+        log_success "Laravel API ready (composer install runs inside Docker)"
+        ;;
+      laravel-ssr)
+        log_info "Building Laravel SSR application..."
+        if command -v yarn &>/dev/null && [[ -f "yarn.lock" ]]; then
+          yarn install --immutable 2>/dev/null || yarn install
+          yarn build
+        elif command -v npm &>/dev/null; then
+          npm ci 2>/dev/null || npm install
+          npm run build
+        fi
+        log_success "Laravel SSR application built (composer install runs inside Docker)"
+        ;;
+      java-maven)
+        log_info "Building Java application with Maven..."
+        mvn package -DskipTests
+        log_success "Maven build completed"
+        ;;
+      java-gradle)
+        log_info "Building Java application with Gradle..."
+        ./gradlew build -x test
+        log_success "Gradle build completed"
+        ;;
+      docker-only)
+        log_info "Skipping application build (docker-only mode)"
+        ;;
+    esac
+    cd - > /dev/null
+
+    log_info "Building Docker image (linux/amd64,linux/arm64)..."
+
+    IMAGE_NAME="$ECR_REPO_URI:latest"
+    if docker buildx version &>/dev/null; then
+      docker buildx create --name multiarch --use 2>/dev/null || docker buildx use multiarch 2>/dev/null || true
+      docker buildx build --platform linux/amd64,linux/arm64 -t "$IMAGE_NAME" "$OUTPUT_DIR" --push
+    else
+      docker build -t "$IMAGE_NAME" "$OUTPUT_DIR"
+      log_info "Pushing image to ECR..."
+      docker push "$IMAGE_NAME"
+    fi
+
+    log_success "Image pushed: $IMAGE_NAME"
+  else
+    log_warn "No Dockerfile found in $OUTPUT_DIR - skipping image build"
+    log_warn "You'll need to build and push the image manually before terraform apply"
+  fi
+
+  # Process environment variables
+  ENV_VARS_TF=""
+  SECRET_ENV_VARS_TF=""
+
+  # Auto-detect env file if --env-file not specified
+  if [[ -z "$ENV_FILE" ]]; then
+    case "$PROJECT_TYPE" in
+      laravel-api|laravel-ssr)
+        if [[ -f "$OUTPUT_DIR/.env.production" ]]; then
+          ENV_FILE="$OUTPUT_DIR/.env.production"
+        fi
+        ;;
+      *)
+        if [[ -f "$OUTPUT_DIR/.env.local" ]]; then
+          ENV_FILE="$OUTPUT_DIR/.env.local"
+        fi
+        ;;
+    esac
+  fi
+
+  if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
+    print_header "Step 4: Processing Environment Variables"
+
+    log_info "Reading environment file: $ENV_FILE"
+    echo ""
+    echo "┌────────────────────────────────────────────────────────────────────┐"
+    echo "│  Annotation syntax:                                                │"
+    echo "│    # @secret    → AWS Secrets Manager (runtime)                    │"
+    echo "│    # @build     → GitHub Variables (build-time)                    │"
+    echo "│    # @public    → ECS env vars (runtime, default)                  │"
+    if [[ "$PROJECT_TYPE" == "nodejs" ]]; then
+    echo "│    NEXT_PUBLIC_* without tag → auto-detected as @build             │"
+    fi
+    echo "└────────────────────────────────────────────────────────────────────┘"
+    echo ""
+
+    # Use temp files instead of associative arrays (bash 3.x compatibility)
+    ENV_KEYS_FILE=$(mktemp)
+    ENV_VALUES_FILE=$(mktemp)
+    SECRET_KEYS_FILE=$(mktemp)
+    SECRET_VALUES_FILE=$(mktemp)
+    BUILD_KEYS_FILE=$(mktemp)
+    BUILD_VALUES_FILE=$(mktemp)
+    trap "rm -f $ENV_KEYS_FILE $ENV_VALUES_FILE $SECRET_KEYS_FILE $SECRET_VALUES_FILE $BUILD_KEYS_FILE $BUILD_VALUES_FILE" EXIT
+
+    next_marker=""
+    env_count=0
+    secret_count=0
+    build_count=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ -z "$line" ]] && continue
+
+      if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*@secret ]]; then
+        next_marker="secret"
+        continue
+      elif [[ "$line" =~ ^[[:space:]]*#[[:space:]]*@build ]]; then
+        next_marker="build"
+        continue
+      elif [[ "$line" =~ ^[[:space:]]*#[[:space:]]*@public ]]; then
+        next_marker="public"
+        continue
+      fi
+
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+      if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+
+        value="${value#\"}"
+        value="${value%\"}"
+        value="${value#\'}"
+        value="${value%\'}"
+
+        if [[ "$next_marker" == "secret" ]]; then
+          echo "$key" >> "$SECRET_KEYS_FILE"
+          echo "$value" >> "$SECRET_VALUES_FILE"
+          ((secret_count++))
+        elif [[ "$next_marker" == "build" ]] || { [[ "$PROJECT_TYPE" == "nodejs" ]] && [[ "$key" == NEXT_PUBLIC_* ]]; }; then
+          echo "$key" >> "$BUILD_KEYS_FILE"
+          echo "$value" >> "$BUILD_VALUES_FILE"
+          ((build_count++))
+        else
+          echo "$key" >> "$ENV_KEYS_FILE"
+          echo "$value" >> "$ENV_VALUES_FILE"
+          ((env_count++))
+        fi
+
+        # Capture DB_DATABASE for RDS
+        if [[ "$key" == "DB_DATABASE" ]]; then
+          DB_DATABASE="$value"
+        fi
+
+        # Auto-detect S3 bucket from AWS_BUCKET
+        if [[ "$key" == "AWS_BUCKET" && -n "$value" ]]; then
+          if [[ -z "$STORAGE_BUCKET" ]]; then
+            STORAGE_BUCKET="$value"
+          fi
+        fi
+
+        next_marker=""
+      fi
+    done < "$ENV_FILE"
+
+    # Display grouped by type
+    if [[ $secret_count -gt 0 ]]; then
+      echo ""
+      echo -e "${RED}Secrets - AWS Secrets Manager ($secret_count):${NC}"
+      while IFS= read -r key; do
+        echo "  • $key"
+      done < "$SECRET_KEYS_FILE"
+    fi
+
+    if [[ $build_count -gt 0 ]]; then
+      echo ""
+      echo -e "${YELLOW}Build-time Variables - GitHub Variables ($build_count):${NC}"
+      while IFS= read -r key; do
+        echo "  • $key"
+      done < "$BUILD_KEYS_FILE"
+    fi
+
+    if [[ $env_count -gt 0 ]]; then
+      echo ""
+      echo -e "${GREEN}Runtime Variables - ECS Task Definition ($env_count):${NC}"
+      while IFS= read -r key; do
+        echo "  • $key"
+      done < "$ENV_KEYS_FILE"
+    fi
+
+    if [[ -n "$STORAGE_BUCKET" ]]; then
+      echo ""
+      echo -e "${BLUE}S3 Storage Bucket (auto-detected from AWS_BUCKET):${NC}"
+      echo "  • $STORAGE_BUCKET"
+    fi
+
+    echo ""
+
+    if [[ $secret_count -gt 0 ]] || [[ $build_count -gt 0 ]]; then
+      if [[ "$AUTO_APPROVE" != "true" ]]; then
+        read -p "Continue with this classification? (y/n) " -n 1 -r < /dev/tty
+        echo ""
+
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+          log_warn "Aborted. Please update your .env file with @secret/@public markers and try again."
+          exit 1
+        fi
+      fi
+    fi
+
+    if [[ $secret_count -gt 0 ]]; then
+      log_info "Preparing secrets configuration (Terraform managed)..."
+      SECRET_KEYS_LIST=""
+      while IFS= read -r key; do
+        SECRET_KEYS_LIST+="$key "
+      done < "$SECRET_KEYS_FILE"
+      log_success "Secrets will be managed by Terraform via GitHub Secrets"
+      log_info "Secret keys: $SECRET_KEYS_LIST"
+    fi
+
+    # Build terraform env_vars
+    ALL_KEYS_FILE=$(mktemp)
+    ALL_VALUES_FILE=$(mktemp)
+    cat "$ENV_KEYS_FILE" "$SECRET_KEYS_FILE" "$BUILD_KEYS_FILE" > "$ALL_KEYS_FILE" 2>/dev/null || true
+    cat "$ENV_VALUES_FILE" "$SECRET_VALUES_FILE" "$BUILD_VALUES_FILE" > "$ALL_VALUES_FILE" 2>/dev/null || true
+
+    resolve_env_refs() {
+      local value="$1"
+      local resolved="$value"
+      while [[ "$resolved" =~ \$\{([A-Za-z_][A-Za-z0-9_]*)\} ]]; do
+        local var_name="${BASH_REMATCH[1]}"
+        local var_value=""
+        local line_num=1
+        while IFS= read -r k; do
+          if [[ "$k" == "$var_name" ]]; then
+            var_value=$(sed -n "${line_num}p" "$ALL_VALUES_FILE")
+            break
+          fi
+          ((line_num++))
+        done < "$ALL_KEYS_FILE"
+        resolved="${resolved/\$\{$var_name\}/$var_value}"
+      done
+      echo "$resolved"
+    }
+
+    ENV_VARS_TF="  NODE_ENV = \"production\"\n"
+    if [[ $env_count -gt 0 ]]; then
+      while IFS= read -r key && IFS= read -r value <&3; do
+        resolved_value=$(resolve_env_refs "$value")
+        escaped_value=$(echo "$resolved_value" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        ENV_VARS_TF+="  $key = \"$escaped_value\"\n"
+      done < "$ENV_KEYS_FILE" 3< "$ENV_VALUES_FILE"
+    fi
+
+    rm -f "$ALL_KEYS_FILE" "$ALL_VALUES_FILE"
+
+    if [[ "$PROJECT_TYPE" == "laravel-api" ]] || [[ "$PROJECT_TYPE" == "laravel-ssr" ]]; then
+      if ! grep -q "^  LOG_STACK = " <<< "$ENV_VARS_TF"; then
+        log_info "Adding cloud-native logging defaults for Laravel..."
+        ENV_VARS_TF+="  LOG_STACK = \"stderr\"\n"
+        log_success "Set LOG_STACK=stderr (required for container environments)"
+      fi
+    fi
+
+    log_success "Environment variables processed"
+  else
+    ENV_VARS_TF="  NODE_ENV = \"production\""
+
+    if [[ "$PROJECT_TYPE" == "laravel-api" ]] || [[ "$PROJECT_TYPE" == "laravel-ssr" ]]; then
+      ENV_VARS_TF+="\n  LOG_STACK = \"stderr\""
+    fi
+
+    log_info "No env file found, using defaults"
+  fi
+
+  # Create directory structure
+  print_header "Step 5: Creating Project Structure"
+
+  mkdir -p "$INFRA_DIR"
+  mkdir -p "$WORKFLOWS_DIR"
+  log_success "Created directories: infra/aws/, .github/workflows/"
+
+  # Convert subnet IDs to Terraform list format
+  PUBLIC_SUBNET_TF=$(echo "$PUBLIC_SUBNET_IDS" | sed 's/,/", "/g' | sed 's/^/"/; s/$/"/')
+  PRIVATE_SUBNET_TF=$(echo "$PRIVATE_SUBNET_IDS" | sed 's/,/", "/g' | sed 's/^/"/; s/$/"/')
+
+  # Create terraform.tfvars for AWS
+  cat > "$INFRA_DIR/terraform.tfvars" << EOF
+region           = "$REGION"
+service_name     = "$SERVICE_NAME"
+github_repo      = "$GITHUB_REPO"
+
+vpc_id             = "$VPC_ID"
+public_subnet_ids  = [$PUBLIC_SUBNET_TF]
+private_subnet_ids = [$PRIVATE_SUBNET_TF]
+
+container_port    = $CONTAINER_PORT
+health_check_path = "$HEALTH_CHECK_PATH"
+
+ecs_cpu           = "1024"
+ecs_memory        = "2048"
+ecs_desired_count = 1
+ecs_min_count     = 1
+ecs_max_count     = 4
+
+env_vars = {
+$(echo -e "$ENV_VARS_TF")
+}
+
+# Secret keys (values are passed via -var in CI/CD from GitHub Secrets)
+# Terraform creates secrets in AWS Secrets Manager with prefix: ${SERVICE_NAME}/
+secret_keys = [$(if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+  first=true
+  while IFS= read -r key; do
+    if [[ "$first" == "true" ]]; then
+      first=false
+    else
+      echo -n ", "
+    fi
+    echo -n "\"$key\""
+  done < "$SECRET_KEYS_FILE"
+fi)]
+
+certificate_arn = "${CERTIFICATE_ARN:-}"
+s3_bucket_arns  = [$(if [[ -n "$STORAGE_BUCKET" ]]; then echo "\"arn:aws:s3:::$STORAGE_BUCKET\", \"arn:aws:s3:::$STORAGE_BUCKET/*\""; fi)]
+EOF
+  log_success "Created infra/aws/terraform.tfvars"
+
+  # Create main.tf for AWS
+  cat > "$INFRA_DIR/main.tf" << EOF
+terraform {
+  required_version = ">= 1.5"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+
+  backend "s3" {
+    bucket = "$STATE_BUCKET"
+    key    = "terraform/state/terraform.tfstate"
+    region = "$REGION"
+  }
+}
+
+provider "aws" {
+  region = var.region
+
+  default_tags {
+    tags = {
+      ManagedBy = "terraform"
+      Service   = var.service_name
+    }
+  }
+}
+
+locals {
+  ecr_repo_name = "ecr-\${var.service_name}"
+}
+
+module "oidc_provider" {
+  source = "github.com/$TERRAFORM_MODULES_REPO//modules/aws/oidc-provider?ref=main"
+
+  role_name   = "github-actions-\${var.service_name}"
+  github_repo = var.github_repo
+
+  policy_arns = [
+    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser",
+    "arn:aws:iam::aws:policy/AmazonECS_FullAccess",
+    "arn:aws:iam::aws:policy/SecretsManagerReadWrite",
+  ]
+}
+
+module "ecr" {
+  source = "github.com/$TERRAFORM_MODULES_REPO//modules/aws/ecr?ref=main"
+
+  repository_name      = local.ecr_repo_name
+  image_tag_mutability = "MUTABLE"
+  scan_on_push         = true
+  force_delete         = true
+  keep_image_count     = 10
+}
+
+# Secrets Manager - Terraform managed secrets with service prefix
+resource "aws_secretsmanager_secret" "secrets" {
+  for_each = toset(var.secret_keys)
+  name     = "\${var.service_name}/\${lower(replace(each.value, "_", "-"))}"
+
+  tags = {
+    Service = var.service_name
+    Managed = "terraform"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "secrets" {
+  for_each      = toset(var.secret_keys)
+  secret_id     = aws_secretsmanager_secret.secrets[each.value].id
+  secret_string = var.secret_values[each.value]
+
+  lifecycle {
+    ignore_changes = [secret_string]
+  }
+}
+
+module "ecs_fargate" {
+  source = "github.com/$TERRAFORM_MODULES_REPO//modules/aws/ecs-fargate?ref=main"
+
+  cluster_name = "ecs-\${var.service_name}"
+  service_name = var.service_name
+  image        = "\${module.ecr.repository_url}:\${var.image_tag}"
+
+  vpc_id             = var.vpc_id
+  public_subnet_ids  = var.public_subnet_ids
+  private_subnet_ids = var.private_subnet_ids
+
+  container_port    = var.container_port
+  health_check_path = var.health_check_path
+
+  cpu           = var.ecs_cpu
+  memory        = var.ecs_memory
+  desired_count = var.ecs_desired_count
+  min_count     = var.ecs_min_count
+  max_count     = var.ecs_max_count
+
+  env_vars = var.env_vars
+
+  secret_env_vars = {
+    for name in var.secret_keys : name => aws_secretsmanager_secret.secrets[name].arn
+  }
+
+  secret_arns    = [for s in aws_secretsmanager_secret.secrets : s.arn]
+  s3_bucket_arns = var.s3_bucket_arns
+
+  certificate_arn     = var.certificate_arn
+  deletion_protection = var.deletion_protection
+
+  depends_on = [module.ecr, aws_secretsmanager_secret_version.secrets]
+}
+EOF
+  log_success "Created infra/aws/main.tf"
+
+  # Create variables.tf for AWS
+  cat > "$INFRA_DIR/variables.tf" << 'EOF'
+variable "region" {
+  description = "AWS Region"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "service_name" {
+  description = "Service name (used for ECS service and resource naming)"
+  type        = string
+}
+
+variable "github_repo" {
+  description = "GitHub repository in format owner/repo"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "VPC ID where resources will be created"
+  type        = string
+}
+
+variable "public_subnet_ids" {
+  description = "List of public subnet IDs for the ALB"
+  type        = list(string)
+}
+
+variable "private_subnet_ids" {
+  description = "List of private subnet IDs for ECS tasks"
+  type        = list(string)
+}
+
+variable "container_port" {
+  description = "Container port"
+  type        = number
+  default     = 80
+}
+
+variable "health_check_path" {
+  description = "Health check endpoint path"
+  type        = string
+  default     = "/up"
+}
+
+variable "ecs_cpu" {
+  description = "CPU units for ECS task (256, 512, 1024, 2048, 4096)"
+  type        = string
+  default     = "1024"
+}
+
+variable "ecs_memory" {
+  description = "Memory for ECS task in MB"
+  type        = string
+  default     = "2048"
+}
+
+variable "ecs_desired_count" {
+  description = "Desired number of ECS tasks"
+  type        = number
+  default     = 1
+}
+
+variable "ecs_min_count" {
+  description = "Minimum number of ECS tasks for autoscaling"
+  type        = number
+  default     = 1
+}
+
+variable "ecs_max_count" {
+  description = "Maximum number of ECS tasks for autoscaling"
+  type        = number
+  default     = 4
+}
+
+variable "env_vars" {
+  description = "Environment variables for ECS task"
+  type        = map(string)
+  default     = {}
+}
+
+variable "secret_keys" {
+  description = "List of secret environment variable names. Used for creating Secrets Manager secrets with service_name prefix."
+  type        = list(string)
+  default     = []
+}
+
+variable "secret_values" {
+  description = "Map of secret values (ENV_NAME => value). Values come from GitHub Secrets via -var in CI/CD."
+  type        = map(string)
+  default     = {}
+  sensitive   = true
+}
+
+variable "image_tag" {
+  description = "Docker image tag for ECS deployment"
+  type        = string
+  default     = "latest"
+}
+
+variable "certificate_arn" {
+  description = "ACM certificate ARN for HTTPS (leave empty for HTTP only)"
+  type        = string
+  default     = ""
+}
+
+variable "s3_bucket_arns" {
+  description = "List of S3 bucket ARNs that the task can access"
+  type        = list(string)
+  default     = []
+}
+
+variable "deletion_protection" {
+  description = "Enable deletion protection for the ALB"
+  type        = bool
+  default     = false
+}
+EOF
+  log_success "Created infra/aws/variables.tf"
+
+  # Create outputs.tf for AWS
+  cat > "$INFRA_DIR/outputs.tf" << 'EOF'
+output "oidc_role_arn" {
+  description = "IAM Role ARN for GitHub Actions"
+  value       = module.oidc_provider.role_arn
+}
+
+output "ecr_repository_url" {
+  description = "ECR repository URL"
+  value       = module.ecr.repository_url
+}
+
+output "alb_dns_name" {
+  description = "ALB DNS name"
+  value       = module.ecs_fargate.alb_dns_name
+}
+
+output "service_url" {
+  description = "Service URL"
+  value       = module.ecs_fargate.service_url
+}
+
+output "ecs_cluster_name" {
+  description = "ECS cluster name"
+  value       = module.ecs_fargate.cluster_name
+}
+
+output "ecs_service_name" {
+  description = "ECS service name"
+  value       = module.ecs_fargate.service_name
+}
+EOF
+  log_success "Created infra/aws/outputs.tf"
+
+  # Create .gitignore for terraform
+  cat > "$INFRA_DIR/.gitignore" << 'EOF'
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+tfplan
+EOF
+  log_success "Created infra/aws/.gitignore"
+
+  # Format terraform files
+  log_info "Formatting terraform files..."
+  terraform -chdir="$INFRA_DIR" fmt > /dev/null
+  log_success "Terraform files formatted"
+
+  # Create GitHub workflows for AWS
+  print_header "Step 6: Creating GitHub Workflows"
+
+  # Generate build steps based on project type (same as GCP)
+  case "$PROJECT_TYPE" in
+    nodejs)
+      CI_BUILD_STEPS="      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - name: Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: \${{ github.workspace }}/.next/cache
+          key: \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-\${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx', '**/*.css', '**/*.scss') }}
+          restore-keys: |
+            \${{ runner.os }}-nextjs-\${{ hashFiles('yarn.lock') }}-
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build application
+        run: yarn build
+        env:
+          NODE_ENV: production"
+      CI_BUILD_NAME="Build & Validate"
+      ;;
+    java-maven)
+      CI_BUILD_STEPS="      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build with Maven
+        run: mvn package -DskipTests"
+      CI_BUILD_NAME="Build & Validate"
+      ;;
+    java-gradle)
+      CI_BUILD_STEPS="      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Build with Gradle
+        run: ./gradlew build -x test"
+      CI_BUILD_NAME="Build & Validate"
+      ;;
+    laravel-api)
+      CI_BUILD_STEPS="      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo, pdo_pgsql, bcmath, intl, zip, gd, redis
+          coverage: none
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: \${{ steps.composer-cache.outputs.dir }}
+          key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
+          restore-keys: \${{ runner.os }}-composer-
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Prepare Laravel
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Run Pint (code style)
+        run: vendor/bin/pint --test
+
+      - name: Run tests
+        run: php artisan test --compact
+        env:
+          APP_ENV: testing"
+      CI_BUILD_NAME="Build & Test"
+      ;;
+    laravel-ssr)
+      CI_BUILD_STEPS="      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo, pdo_pgsql, bcmath, intl, zip, gd, redis
+          coverage: none
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo \"dir=\$(composer config cache-files-dir)\" >> \$GITHUB_OUTPUT
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: \${{ steps.composer-cache.outputs.dir }}
+          key: \${{ runner.os }}-composer-\${{ hashFiles('composer.lock') }}
+          restore-keys: \${{ runner.os }}-composer-
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Prepare Laravel
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - name: Install Node.js dependencies
+        run: yarn install --immutable
+
+      - name: Build frontend assets
+        run: yarn build
+
+      - name: Run Pint (code style)
+        run: vendor/bin/pint --test
+
+      - name: Run tests
+        run: php artisan test --compact
+        env:
+          APP_ENV: testing"
+      CI_BUILD_NAME="Build & Test"
+      ;;
+    docker-only)
+      CI_BUILD_STEPS="      - name: Build Docker image (validation)
+        run: docker build -t test-build ."
+      CI_BUILD_NAME="Build & Validate"
+      ;;
+  esac
+
+  # Create CI workflow (same for all providers)
+  CI_CONTENT="name: CI
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths-ignore:
+      - '*.md'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  build:
+    name: $CI_BUILD_NAME
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+$CI_BUILD_STEPS
+"
+
+  echo -e "$CI_CONTENT" > "$WORKFLOWS_DIR/ci.yml"
+  log_success "Created .github/workflows/ci.yml"
+
+  # Build env vars string for CD workflow (build-time variables)
+  CD_BUILD_ENV_VARS="          NODE_ENV: production"
+  if [[ -f "$BUILD_KEYS_FILE" ]] && [[ -s "$BUILD_KEYS_FILE" ]]; then
+    while IFS= read -r key; do
+      CD_BUILD_ENV_VARS+="\n          $key: \${{ vars.$key }}"
+    done < "$BUILD_KEYS_FILE"
+  fi
+
+  # Generate CD build steps
+  case "$PROJECT_TYPE" in
+    nodejs)
+      CD_BUILD_STEPS="
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Build application
+        run: yarn build
+        env:
+$(echo -e "$CD_BUILD_ENV_VARS")
+"
+      ;;
+    laravel-api)
+      CD_BUILD_STEPS="
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo, pdo_pgsql, bcmath, intl, zip, gd, redis
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-dev --optimize-autoloader --no-interaction
+"
+      ;;
+    laravel-ssr)
+      CD_BUILD_STEPS="
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo, pdo_pgsql, bcmath, intl, zip, gd, redis
+          coverage: none
+
+      - name: Install PHP dependencies
+        run: composer install --no-dev --optimize-autoloader --no-interaction
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - name: Install Node.js dependencies
+        run: yarn install --immutable
+
+      - name: Build frontend assets
+        run: yarn build
+"
+      ;;
+    java-maven)
+      CD_BUILD_STEPS="
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build with Maven
+        run: mvn package -DskipTests
+"
+      ;;
+    java-gradle)
+      CD_BUILD_STEPS="
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Build with Gradle
+        run: ./gradlew build -x test
+"
+      ;;
+    docker-only)
+      CD_BUILD_STEPS=""
+      ;;
+  esac
+
+  # Build TF_VAR_secret_values env var for Terraform (JSON format)
+  if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+    SECRET_ENV_BLOCK="          TF_VAR_secret_values: |"
+    SECRET_ENV_BLOCK+="\n            {"
+    first_key=true
+    while IFS= read -r key; do
+      if [[ "$first_key" == "true" ]]; then
+        first_key=false
+      else
+        SECRET_ENV_BLOCK+=","
+      fi
+      SECRET_ENV_BLOCK+="\n              \"$key\": \"\${{ secrets.$key }}\""
+    done < "$SECRET_KEYS_FILE"
+    SECRET_ENV_BLOCK+="\n            }"
+  else
+    SECRET_ENV_BLOCK=""
+  fi
+
+  # Create AWS CD workflow
+  CD_CONTENT="name: CD
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '*.md'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: $REGION
+  SERVICE_NAME: $SERVICE_NAME
+  AWS_ACCOUNT_ID: $AWS_ACCOUNT_ID
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    environment: Production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: \${{ secrets.AWS_ROLE_ARN }}
+          aws-region: \${{ env.REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+$CD_BUILD_STEPS
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: \${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ecr-\${{ env.SERVICE_NAME }}
+          IMAGE_TAG: \${{ github.sha }}
+        run: |
+          docker build -t \$ECR_REGISTRY/\$ECR_REPOSITORY:\$IMAGE_TAG .
+          docker tag \$ECR_REGISTRY/\$ECR_REPOSITORY:\$IMAGE_TAG \$ECR_REGISTRY/\$ECR_REPOSITORY:latest
+
+      - name: Push Docker image
+        env:
+          ECR_REGISTRY: \${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ecr-\${{ env.SERVICE_NAME }}
+          IMAGE_TAG: \${{ github.sha }}
+        run: |
+          docker push \$ECR_REGISTRY/\$ECR_REPOSITORY:\$IMAGE_TAG
+          docker push \$ECR_REGISTRY/\$ECR_REPOSITORY:latest
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: \"~> 1.10\"
+
+      - name: Terraform Init
+        working-directory: infra/aws
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: infra/aws
+        env:
+          TF_VAR_image_tag: \${{ github.sha }}
+$(echo -e "$SECRET_ENV_BLOCK")
+        run: terraform apply -var-file=terraform.tfvars -auto-approve -input=false"
+
+  echo -e "$CD_CONTENT" > "$WORKFLOWS_DIR/cd.yml"
+  log_success "Created .github/workflows/cd.yml"
+
+  # Run terraform if not skipped
+  if [[ "$SKIP_TERRAFORM" != "true" ]]; then
+    print_header "Step 7: Running Terraform"
+
+    cd "$INFRA_DIR"
+
+    if [[ -d ".terraform" ]]; then
+      log_info "Cleaning up old terraform cache..."
+      rm -rf .terraform
+    fi
+
+    log_info "Terraform init..."
+    terraform init
+
+    # Build secret_values for local terraform commands
+    SECRET_VALUES_VAR=""
+    if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+      SECRET_VAR_ITEMS=""
+      while IFS= read -r key && IFS= read -r value <&3; do
+        if [[ -n "$SECRET_VAR_ITEMS" ]]; then
+          SECRET_VAR_ITEMS+=","
+        fi
+        escaped_value=$(echo "$value" | sed 's/"/\\"/g')
+        SECRET_VAR_ITEMS+="\"$key\":\"$escaped_value\""
+      done < "$SECRET_KEYS_FILE" 3< "$SECRET_VALUES_FILE"
+      SECRET_VALUES_VAR="-var=secret_values={$SECRET_VAR_ITEMS}"
+    fi
+
+    log_info "Terraform plan..."
+    terraform plan -var-file=terraform.tfvars $SECRET_VALUES_VAR -out=tfplan
+
+    echo ""
+    APPLY_PLAN="false"
+    if [[ "$AUTO_APPROVE" == "true" ]]; then
+      APPLY_PLAN="true"
+    else
+      read -p "Apply this plan? (y/n) " -n 1 -r < /dev/tty
+      echo ""
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        APPLY_PLAN="true"
+      fi
+    fi
+
+    if [[ "$APPLY_PLAN" == "true" ]]; then
+      log_info "Terraform apply..."
+      if terraform apply tfplan; then
+        log_success "Terraform applied"
+      else
+        log_error "Terraform apply failed"
+        exit 1
+      fi
+
+      # Get outputs for GitHub secrets
+      AWS_ROLE_ARN=$(terraform output -raw oidc_role_arn 2>/dev/null || echo "")
+    else
+      log_warn "Skipped terraform apply"
+    fi
+
+    cd - > /dev/null
+  else
+    log_warn "Skipped terraform (use --skip-terraform=false to run)"
+  fi
+
+  # Configure GitHub secrets
+  print_header "Step 8: GitHub Secrets Configuration"
+
+  if command -v gh &> /dev/null; then
+    log_info "GitHub CLI detected. Checking authentication..."
+
+    if gh auth token &>/dev/null; then
+      log_success "GitHub CLI authenticated"
+
+      echo ""
+      CONFIGURE_SECRETS="false"
+      if [[ "$AUTO_APPROVE" == "true" ]]; then
+        CONFIGURE_SECRETS="true"
+      else
+        read -p "Configure GitHub secrets automatically? (y/n) " -n 1 -r < /dev/tty
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+          CONFIGURE_SECRETS="true"
+        fi
+      fi
+
+      if [[ "$CONFIGURE_SECRETS" == "true" ]]; then
+        log_info "Configuring GitHub secrets for $GITHUB_REPO (environment: Production)..."
+
+        gh api "repos/$GITHUB_REPO/environments/Production" --method PUT --silent 2>/dev/null || true
+
+        if [[ -n "$AWS_ROLE_ARN" ]]; then
+          echo "$AWS_ROLE_ARN" | gh secret set AWS_ROLE_ARN --repo="$GITHUB_REPO" --env=Production
+          log_success "Set AWS_ROLE_ARN"
+        fi
+
+        # Set build-time variables
+        if [[ -f "$BUILD_KEYS_FILE" ]] && [[ -s "$BUILD_KEYS_FILE" ]]; then
+          log_info "Creating GitHub Variables for build-time env vars..."
+          while IFS= read -r key && IFS= read -r value <&3; do
+            echo "$value" | gh variable set "$key" --repo="$GITHUB_REPO" --env=Production
+            log_success "Set variable: $key"
+          done < "$BUILD_KEYS_FILE" 3< "$BUILD_VALUES_FILE"
+        fi
+
+        # Set secrets for Terraform
+        if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+          log_info "Creating GitHub Secrets for Terraform-managed secrets..."
+          while IFS= read -r key && IFS= read -r value <&3; do
+            echo "$value" | gh secret set "$key" --repo="$GITHUB_REPO" --env=Production
+            log_success "Set secret: $key"
+          done < "$SECRET_KEYS_FILE" 3< "$SECRET_VALUES_FILE"
+        fi
+
+        log_success "GitHub secrets and variables configured in 'Production' environment!"
+      else
+        log_warn "Skipped GitHub secrets configuration"
+      fi
+    else
+      log_warn "GitHub CLI not authenticated. Run: gh auth login"
+    fi
+  else
+    log_warn "GitHub CLI not found. Install it to auto-configure secrets: https://cli.github.com"
+  fi
+
+  # Manual instructions if secrets not configured
+  if [[ -z "$AWS_ROLE_ARN" ]] || ! command -v gh &> /dev/null; then
+    echo ""
+    echo "Add these secrets to your GitHub repository manually:"
+    echo ""
+    echo "┌────────────────────────────────────────────────────────────────────┐"
+    echo "│ Repository Settings → Secrets and variables → Actions             │"
+    echo "│ Environment: Production                                            │"
+    echo "├────────────────────────────────────────────────────────────────────┤"
+    echo "│                                                                    │"
+    echo "│ AWS_ROLE_ARN:                                                      │"
+    if [[ -n "$AWS_ROLE_ARN" ]]; then
+      echo "│ $AWS_ROLE_ARN"
+    else
+      echo "│ (run terraform apply first)"
+    fi
+    if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+      echo "│                                                                    │"
+      echo "│ Terraform-managed secrets (from .env):                             │"
+      while IFS= read -r key; do
+        echo "│   • $key"
+      done < "$SECRET_KEYS_FILE"
+    fi
+    echo "│                                                                    │"
+    echo "└────────────────────────────────────────────────────────────────────┘"
+  fi
+
+  # Custom domain configuration for AWS
+  if [[ -n "$CUSTOM_DOMAIN" ]]; then
+    print_header "Step 9: Custom Domain Configuration"
+
+    # Get ALB DNS name
+    ALB_DNS_NAME=$(terraform -chdir="$INFRA_DIR" output -raw alb_dns_name 2>/dev/null || echo "")
+
+    echo "Custom domain: $CUSTOM_DOMAIN"
+    echo ""
+
+    # Extract subdomain and root domain
+    ROOT_DOMAIN=$(echo "$CUSTOM_DOMAIN" | awk -F. '{if (NF>2) print $(NF-1)"."$NF; else print $0}')
+    SUBDOMAIN="${CUSTOM_DOMAIN%%.$ROOT_DOMAIN}"
+    if [[ "$SUBDOMAIN" == "$CUSTOM_DOMAIN" ]]; then
+      SUBDOMAIN="@"
+    fi
+
+    echo "┌────────────────────────────────────────────────────────────────────┐"
+    echo "│  Step 1: Create/Verify ACM Certificate                             │"
+    echo "├────────────────────────────────────────────────────────────────────┤"
+    echo "│                                                                    │"
+    echo "│  If you don't have an ACM certificate yet:                         │"
+    echo "│                                                                    │"
+    echo "│  aws acm request-certificate \\                                     │"
+    echo "│    --domain-name $CUSTOM_DOMAIN \\                                  │"
+    echo "│    --validation-method DNS \\                                       │"
+    echo "│    --region $REGION                                                │"
+    echo "│                                                                    │"
+    echo "│  Then add the CNAME validation record to your DNS provider.        │"
+    echo "│                                                                    │"
+    if [[ -n "$CERTIFICATE_ARN" ]]; then
+    echo "│  ✓ Certificate ARN provided: $CERTIFICATE_ARN                      │"
+    else
+    echo "│  ⚠ No --certificate-arn provided. HTTPS will not be enabled.       │"
+    echo "│    Re-run with --certificate-arn=ARN after creating certificate.   │"
+    fi
+    echo "│                                                                    │"
+    echo "└────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "┌────────────────────────────────────────────────────────────────────┐"
+    echo "│  Step 2: Configure DNS Records                                     │"
+    echo "├────────────────────────────────────────────────────────────────────┤"
+    echo "│                                                                    │"
+    echo "│  Add this record in your DNS provider:                             │"
+    echo "│                                                                    │"
+    echo "│  Type:   CNAME                                                     │"
+    echo "│  Name:   $SUBDOMAIN                                                │"
+    if [[ -n "$ALB_DNS_NAME" ]]; then
+    echo "│  Target: $ALB_DNS_NAME                                             │"
+    else
+    echo "│  Target: (run terraform apply to get ALB DNS name)                 │"
+    fi
+    echo "│  TTL:    300 (or Auto)                                             │"
+    echo "│                                                                    │"
+    echo "│  Note: For root domain (@), use an ALIAS/ANAME record if your      │"
+    echo "│  DNS provider supports it, or use a subdomain (www, app, etc.)     │"
+    echo "│                                                                    │"
+    echo "└────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    log_info "After DNS propagation, your service will be available at:"
+    if [[ -n "$CERTIFICATE_ARN" ]]; then
+      echo "  https://$CUSTOM_DOMAIN"
+    else
+      echo "  http://$CUSTOM_DOMAIN"
+    fi
+    echo ""
+  fi
+
+  print_header "Bootstrap Complete!"
+
+  echo "Generated files:"
+  echo "  $INFRA_DIR/"
+  echo "    ├── main.tf"
+  echo "    ├── variables.tf"
+  echo "    ├── outputs.tf"
+  echo "    ├── terraform.tfvars"
+  echo "    └── .gitignore"
+  echo "  $WORKFLOWS_DIR/"
+  echo "    ├── ci.yml              (build & test - runs on PR)"
+  echo "    └── cd.yml              (build + deploy - runs on push to main)"
+  echo ""
+  echo "Next steps:"
+  echo "  1. Review generated files"
+  echo "  2. Commit and push to GitHub"
+  echo "  3. The CD pipeline will build and deploy on push to main"
+  if [[ -n "$CUSTOM_DOMAIN" && -z "$CERTIFICATE_ARN" ]]; then
+  echo "  4. Create ACM certificate and re-run with --certificate-arn"
+  echo "  5. Configure DNS CNAME record"
+  elif [[ -n "$CUSTOM_DOMAIN" ]]; then
+  echo "  4. Configure DNS CNAME record pointing to ALB"
+  fi
+  echo ""
+
+  # Show service URL
+  ALB_DNS_NAME=$(terraform -chdir="$INFRA_DIR" output -raw alb_dns_name 2>/dev/null || echo "")
+  if [[ -n "$ALB_DNS_NAME" ]]; then
+    echo "Service URL: http://$ALB_DNS_NAME"
+    if [[ -n "$CUSTOM_DOMAIN" ]]; then
+      if [[ -n "$CERTIFICATE_ARN" ]]; then
+        echo "Custom URL:  https://$CUSTOM_DOMAIN (after DNS configuration)"
+      else
+        echo "Custom URL:  http://$CUSTOM_DOMAIN (after DNS configuration)"
+      fi
+    fi
+    echo ""
+  fi
+
+  log_success "Done!"
+  exit 0
+fi
+
+# ============================================================================
+# GCP PROVIDER FLOW (existing implementation below)
+# ============================================================================
 
 print_header "GCP Cloud Run Bootstrap"
 
