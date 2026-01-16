@@ -46,6 +46,12 @@ variable "memory" {
   default     = "2048"
 }
 
+variable "cpu_architecture" {
+  description = "CPU architecture (X86_64 or ARM64). ARM64 uses Graviton and is 20% cheaper."
+  type        = string
+  default     = "ARM64"
+}
+
 variable "desired_count" {
   description = "Desired number of tasks"
   type        = number

@@ -834,6 +834,22 @@ if [[ "$PROVIDER" == "aws" ]]; then
       echo ""
       echo -e "${BLUE}S3 Storage Bucket (auto-detected from AWS_BUCKET):${NC}"
       echo "  • $STORAGE_BUCKET"
+
+      # Create storage bucket if it doesn't exist
+      if ! aws s3api head-bucket --bucket "$STORAGE_BUCKET" 2>/dev/null; then
+        log_info "Creating S3 storage bucket: $STORAGE_BUCKET"
+        if [[ "$REGION" == "us-east-1" ]]; then
+          aws s3api create-bucket --bucket "$STORAGE_BUCKET" --region "$REGION"
+        else
+          aws s3api create-bucket --bucket "$STORAGE_BUCKET" --region "$REGION" \
+            --create-bucket-configuration LocationConstraint="$REGION"
+        fi
+        aws s3api put-bucket-encryption --bucket "$STORAGE_BUCKET" \
+          --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+        aws s3api put-public-access-block --bucket "$STORAGE_BUCKET" \
+          --public-access-block-configuration 'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+        log_success "Storage bucket created with encryption"
+      fi
     fi
 
     echo ""
