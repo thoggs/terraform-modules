@@ -120,52 +120,19 @@ resource "aws_iam_role_policy" "pass_role" {
   policy = data.aws_iam_policy_document.pass_role.json
 }
 
-# IAM permissions for Terraform to manage OIDC provider
-data "aws_iam_policy_document" "iam_oidc" {
+# Full infrastructure management permissions for Terraform
+# This policy grants all necessary permissions for managing AWS infrastructure
+data "aws_iam_policy_document" "infra_management" {
+  # IAM - for roles, policies, OIDC providers
   statement {
     actions = [
-      "iam:GetOpenIDConnectProvider",
-      "iam:CreateOpenIDConnectProvider",
-      "iam:DeleteOpenIDConnectProvider",
-      "iam:UpdateOpenIDConnectProviderThumbprint",
-      "iam:TagOpenIDConnectProvider",
-      "iam:UntagOpenIDConnectProvider",
-      "iam:ListOpenIDConnectProviders"
+      "iam:*"
     ]
     effect    = "Allow"
     resources = ["*"]
   }
 
-  statement {
-    actions = [
-      "iam:GetRole",
-      "iam:CreateRole",
-      "iam:DeleteRole",
-      "iam:UpdateRole",
-      "iam:TagRole",
-      "iam:UntagRole",
-      "iam:ListRolePolicies",
-      "iam:GetRolePolicy",
-      "iam:PutRolePolicy",
-      "iam:DeleteRolePolicy",
-      "iam:AttachRolePolicy",
-      "iam:DetachRolePolicy",
-      "iam:ListAttachedRolePolicies",
-      "iam:ListInstanceProfilesForRole"
-    ]
-    effect    = "Allow"
-    resources = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/*"]
-  }
-}
-
-resource "aws_iam_role_policy" "iam_oidc" {
-  name   = "iam-oidc-management"
-  role   = aws_iam_role.github_actions.id
-  policy = data.aws_iam_policy_document.iam_oidc.json
-}
-
-# RDS permissions for Terraform (always enabled - needed for infra management)
-data "aws_iam_policy_document" "rds" {
+  # RDS - databases
   statement {
     actions = [
       "rds:*"
@@ -173,10 +140,109 @@ data "aws_iam_policy_document" "rds" {
     effect    = "Allow"
     resources = ["*"]
   }
+
+  # CloudWatch Logs
+  statement {
+    actions = [
+      "logs:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+
+  # ELB - Load Balancers
+  statement {
+    actions = [
+      "elasticloadbalancing:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+
+  # EC2 - Security Groups, VPC, Subnets, etc
+  statement {
+    actions = [
+      "ec2:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+
+  # ACM - Certificates
+  statement {
+    actions = [
+      "acm:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+
+  # Route53 - DNS (if needed)
+  statement {
+    actions = [
+      "route53:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+
+  # CloudWatch - Metrics, Alarms
+  statement {
+    actions = [
+      "cloudwatch:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+
+  # Application Auto Scaling
+  statement {
+    actions = [
+      "application-autoscaling:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+
+  # Service Discovery
+  statement {
+    actions = [
+      "servicediscovery:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+
+  # KMS - for encryption
+  statement {
+    actions = [
+      "kms:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+
+  # SNS - notifications
+  statement {
+    actions = [
+      "sns:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+
+  # SQS - queues
+  statement {
+    actions = [
+      "sqs:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
 }
 
-resource "aws_iam_role_policy" "rds" {
-  name   = "rds-management"
+resource "aws_iam_role_policy" "infra_management" {
+  name   = "terraform-infra-management"
   role   = aws_iam_role.github_actions.id
-  policy = data.aws_iam_policy_document.rds.json
+  policy = data.aws_iam_policy_document.infra_management.json
 }
