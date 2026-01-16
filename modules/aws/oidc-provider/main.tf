@@ -239,6 +239,15 @@ data "aws_iam_policy_document" "infra_management" {
     effect    = "Allow"
     resources = ["*"]
   }
+
+  # ElastiCache - Redis/Valkey
+  statement {
+    actions = [
+      "elasticache:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
 }
 
 resource "aws_iam_role_policy" "infra_management" {
