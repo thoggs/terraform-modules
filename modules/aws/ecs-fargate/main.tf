@@ -342,7 +342,7 @@ resource "aws_ecs_service" "main" {
   tags = var.tags
 
   lifecycle {
-    ignore_changes = [task_definition, desired_count]
+    ignore_changes = [desired_count]
   }
 }
 
