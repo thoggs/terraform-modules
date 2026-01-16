@@ -960,6 +960,55 @@ if [[ "$PROVIDER" == "aws" ]]; then
     fi
   fi
 
+  # Sync RDS password if RDS already exists (idempotent operation)
+  if [[ "$CREATE_RDS" == "true" && -n "$FINAL_RDS_PASSWORD" ]]; then
+    RDS_IDENTIFIER="rds-${SERVICE_NAME}"
+    if aws rds describe-db-instances --db-instance-identifier "$RDS_IDENTIFIER" --region "$REGION" &>/dev/null; then
+      log_info "RDS instance '$RDS_IDENTIFIER' already exists, syncing master password..."
+      if aws rds modify-db-instance \
+        --db-instance-identifier "$RDS_IDENTIFIER" \
+        --master-user-password "$FINAL_RDS_PASSWORD" \
+        --apply-immediately \
+        --region "$REGION" &>/dev/null; then
+        log_success "RDS master password updated"
+      else
+        log_warn "Could not update RDS master password (may require manual intervention)"
+      fi
+    fi
+
+    # Also update the secret in AWS Secrets Manager if it exists
+    # Terraform creates secrets with lowercase and hyphens: DB_PASSWORD -> db-password
+    SECRET_NAME="${SERVICE_NAME}/db-password"
+    SECRET_UPDATED=false
+    if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" --region "$REGION" &>/dev/null; then
+      log_info "Updating DB_PASSWORD in AWS Secrets Manager..."
+      if aws secretsmanager put-secret-value \
+        --secret-id "$SECRET_NAME" \
+        --secret-string "$FINAL_RDS_PASSWORD" \
+        --region "$REGION" &>/dev/null; then
+        log_success "AWS Secrets Manager secret updated"
+        SECRET_UPDATED=true
+      else
+        log_warn "Could not update AWS Secrets Manager secret"
+      fi
+    fi
+
+    # Force ECS deployment if secrets were updated (so tasks reload the new values)
+    ECS_CLUSTER="ecs-${SERVICE_NAME}"
+    if [[ "$SECRET_UPDATED" == "true" ]] && aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$SERVICE_NAME" --region "$REGION" &>/dev/null; then
+      log_info "Forcing ECS deployment to reload updated secrets..."
+      if aws ecs update-service \
+        --cluster "$ECS_CLUSTER" \
+        --service "$SERVICE_NAME" \
+        --force-new-deployment \
+        --region "$REGION" &>/dev/null; then
+        log_success "ECS deployment triggered"
+      else
+        log_warn "Could not trigger ECS deployment"
+      fi
+    fi
+  fi
+
   # Create terraform.tfvars for AWS
   cat > "$INFRA_DIR/terraform.tfvars" << EOF
 region           = "$REGION"
@@ -1005,7 +1054,7 @@ assign_public_ip  = $(if [[ "$FARGATE_PUBLIC_IP" == "true" ]]; then echo "true";
 create_rds        = $(if [[ "$CREATE_RDS" == "true" ]]; then echo "true"; else echo "false"; fi)
 rds_database_name = "${RDS_DATABASE:-${DB_DATABASE:-app}}"
 rds_username      = "${RDS_USERNAME:-${DB_USERNAME:-postgres}}"
-rds_password      = \"${FINAL_RDS_PASSWORD}\"
+rds_password      = "${FINAL_RDS_PASSWORD}"
 EOF
   log_success "Created infra/aws/terraform.tfvars"
 
@@ -1144,7 +1193,8 @@ module "ecs_fargate" {
 
   vpc_id             = var.vpc_id
   public_subnet_ids  = var.public_subnet_ids
-  private_subnet_ids = var.private_subnet_ids
+  # Use public subnets for tasks when assign_public_ip is true (public IP requires public subnet)
+  private_subnet_ids = var.assign_public_ip ? var.public_subnet_ids : var.private_subnet_ids
 
   container_port    = var.container_port
   health_check_path = var.health_check_path
