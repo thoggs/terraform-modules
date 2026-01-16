@@ -160,6 +160,10 @@ while [[ $# -gt 0 ]]; do
       CREATE_VALKEY=true
       shift
       ;;
+    --cpu-arch=*)
+      CPU_ARCH="${1#*=}"
+      shift
+      ;;
     --org-name=*)
       ORG_NAME="${1#*=}"
       shift
@@ -204,6 +208,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --certificate-arn=ARN      ACM certificate ARN for HTTPS (optional)"
       echo "  --storage-bucket=NAME      S3 bucket name for application storage"
       echo "  --fargate-public-ip        Assign public IP to Fargate tasks (for outbound internet access)"
+      echo "  --cpu-arch=ARCH            CPU architecture: arm64 (default), amd64"
       echo "  --create-rds               Create RDS PostgreSQL instance"
       echo "  --rds-database=NAME        Database name (default: from env DB_DATABASE or 'app')"
       echo "  --rds-username=USER        Database username (default: from env DB_USERNAME or 'postgres')"
@@ -271,6 +276,7 @@ esac
 # Set provider-specific defaults
 if [[ "$PROVIDER" == "aws" ]]; then
   REGION="${REGION:-us-east-1}"
+  CPU_ARCH="${CPU_ARCH:-arm64}"
 fi
 
 # Validate common required arguments
@@ -1274,6 +1280,520 @@ module "ecs_fargate" {
   depends_on = [module.ecr, module.rds_postgres, module.elasticache_valkey, aws_secretsmanager_secret_version.secrets]
 }
 EOF
+
+  # Add CodeBuild and CodePipeline for ARM architecture
+  if [[ "$CPU_ARCH" == "arm64" ]]; then
+    cat >> "$INFRA_DIR/main.tf" << 'CODEBUILD_EOF'
+
+# =============================================================================
+# CodeBuild & CodePipeline (ARM64 Native Build)
+# =============================================================================
+
+# CodeBuild IAM Role
+resource "aws_iam_role" "codebuild" {
+  name = "codebuild-${var.service_name}-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "codebuild.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "codebuild" {
+  name = "codebuild-${var.service_name}-policy"
+  role = aws_iam_role.codebuild.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:PutImage",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:PutObject"
+        ]
+        Resource = [
+          "${aws_s3_bucket.codepipeline.arn}",
+          "${aws_s3_bucket.codepipeline.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [for s in aws_secretsmanager_secret.secrets : s.arn]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecs:UpdateService",
+          "ecs:DescribeServices",
+          "ecs:DescribeTaskDefinition",
+          "ecs:RegisterTaskDefinition",
+          "iam:PassRole"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# CodeBuild Project - CI (Tests)
+resource "aws_codebuild_project" "ci" {
+  name          = "${var.service_name}-ci"
+  description   = "CI pipeline for ${var.service_name} - runs tests"
+  build_timeout = 15
+  service_role  = aws_iam_role.codebuild.arn
+
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type                = "BUILD_GENERAL1_SMALL"
+    image                       = "aws/codebuild/amazonlinux2-aarch64-standard:3.0"
+    type                        = "ARM_CONTAINER"
+    image_pull_credentials_type = "CODEBUILD"
+    privileged_mode             = false
+
+    environment_variable {
+      name  = "SERVICE_NAME"
+      value = var.service_name
+    }
+  }
+
+  source {
+    type      = "CODEPIPELINE"
+    buildspec = "infra/aws/buildspecs/ci.yml"
+  }
+
+  logs_config {
+    cloudwatch_logs {
+      group_name  = "/codebuild/${var.service_name}-ci"
+      stream_name = "build"
+    }
+  }
+
+  tags = {
+    Service = var.service_name
+    Stage   = "CI"
+  }
+}
+
+# CodeBuild Project - CD (Build & Deploy)
+resource "aws_codebuild_project" "cd" {
+  name          = "${var.service_name}-cd"
+  description   = "CD pipeline for ${var.service_name} - builds and deploys"
+  build_timeout = 30
+  service_role  = aws_iam_role.codebuild.arn
+
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type                = "BUILD_GENERAL1_SMALL"
+    image                       = "aws/codebuild/amazonlinux2-aarch64-standard:3.0"
+    type                        = "ARM_CONTAINER"
+    image_pull_credentials_type = "CODEBUILD"
+    privileged_mode             = true
+
+    environment_variable {
+      name  = "SERVICE_NAME"
+      value = var.service_name
+    }
+
+    environment_variable {
+      name  = "AWS_ACCOUNT_ID"
+      value = data.aws_caller_identity.current.account_id
+    }
+
+    environment_variable {
+      name  = "AWS_DEFAULT_REGION"
+      value = var.region
+    }
+
+    environment_variable {
+      name  = "ECR_REPOSITORY"
+      value = local.ecr_repo_name
+    }
+
+    environment_variable {
+      name  = "ECS_CLUSTER"
+      value = "ecs-${var.service_name}"
+    }
+
+    environment_variable {
+      name  = "ECS_SERVICE"
+      value = var.service_name
+    }
+  }
+
+  source {
+    type      = "CODEPIPELINE"
+    buildspec = "infra/aws/buildspecs/cd.yml"
+  }
+
+  logs_config {
+    cloudwatch_logs {
+      group_name  = "/codebuild/${var.service_name}-cd"
+      stream_name = "build"
+    }
+  }
+
+  tags = {
+    Service = var.service_name
+    Stage   = "CD"
+  }
+}
+
+# S3 Bucket for CodePipeline artifacts
+resource "aws_s3_bucket" "codepipeline" {
+  bucket        = "${var.service_name}-${var.org_name}-pipeline"
+  force_destroy = true
+
+  tags = {
+    Service = var.service_name
+  }
+}
+
+resource "aws_s3_bucket_versioning" "codepipeline" {
+  bucket = aws_s3_bucket.codepipeline.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# CodePipeline IAM Role
+resource "aws_iam_role" "codepipeline" {
+  name = "codepipeline-${var.service_name}-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "codepipeline.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "codepipeline" {
+  name = "codepipeline-${var.service_name}-policy"
+  role = aws_iam_role.codepipeline.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:GetBucketVersioning",
+          "s3:PutObject",
+          "s3:PutObjectAcl"
+        ]
+        Resource = [
+          "${aws_s3_bucket.codepipeline.arn}",
+          "${aws_s3_bucket.codepipeline.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "codestar-connections:UseConnection"
+        ]
+        Resource = aws_codestarconnections_connection.github.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "codebuild:BatchGetBuilds",
+          "codebuild:StartBuild"
+        ]
+        Resource = [
+          aws_codebuild_project.ci.arn,
+          aws_codebuild_project.cd.arn
+        ]
+      }
+    ]
+  })
+}
+
+# GitHub Connection (CodeStar)
+resource "aws_codestarconnections_connection" "github" {
+  name          = "${var.service_name}-github"
+  provider_type = "GitHub"
+}
+
+# Data source for current AWS account
+data "aws_caller_identity" "current" {}
+
+# CodePipeline
+resource "aws_codepipeline" "main" {
+  name     = "${var.service_name}-pipeline"
+  role_arn = aws_iam_role.codepipeline.arn
+
+  artifact_store {
+    location = aws_s3_bucket.codepipeline.bucket
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name             = "GitHub"
+      category         = "Source"
+      owner            = "AWS"
+      provider         = "CodeStarSourceConnection"
+      version          = "1"
+      output_artifacts = ["source_output"]
+
+      configuration = {
+        ConnectionArn    = aws_codestarconnections_connection.github.arn
+        FullRepositoryId = var.github_repo
+        BranchName       = "main"
+      }
+    }
+  }
+
+  stage {
+    name = "CI"
+
+    action {
+      name             = "Test"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      version          = "1"
+      input_artifacts  = ["source_output"]
+      output_artifacts = ["ci_output"]
+
+      configuration = {
+        ProjectName = aws_codebuild_project.ci.name
+      }
+    }
+  }
+
+  stage {
+    name = "CD"
+
+    action {
+      name             = "Build-Deploy"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      version          = "1"
+      input_artifacts  = ["source_output"]
+      output_artifacts = ["cd_output"]
+
+      configuration = {
+        ProjectName = aws_codebuild_project.cd.name
+      }
+    }
+  }
+
+  tags = {
+    Service = var.service_name
+  }
+}
+
+# Output the connection status (needs manual approval in AWS Console)
+output "github_connection_status" {
+  description = "GitHub connection status - must be AVAILABLE (approve in AWS Console > CodePipeline > Settings > Connections)"
+  value       = aws_codestarconnections_connection.github.connection_status
+}
+
+output "codepipeline_url" {
+  description = "CodePipeline URL"
+  value       = "https://${var.region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${aws_codepipeline.main.name}/view"
+}
+CODEBUILD_EOF
+    log_success "Added CodeBuild and CodePipeline resources to main.tf"
+
+    # Create buildspecs directory
+    mkdir -p "$INFRA_DIR/buildspecs"
+
+    # Generate buildspec for CI based on project type
+    case "$PROJECT_TYPE" in
+      laravel-ssr)
+        cat > "$INFRA_DIR/buildspecs/ci.yml" << 'CISPEC_EOF'
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      php: 8.3
+      nodejs: 20
+    commands:
+      - echo "Installing dependencies..."
+      - composer install --no-interaction --prefer-dist --optimize-autoloader
+      - corepack enable
+      - yarn install --immutable
+
+  pre_build:
+    commands:
+      - echo "Preparing Laravel..."
+      - cp .env.example .env
+      - php artisan key:generate
+
+  build:
+    commands:
+      - echo "Building frontend assets..."
+      - yarn build
+      - echo "Running code style check..."
+      - vendor/bin/pint --test
+      - echo "Running tests..."
+      - php artisan test --compact
+
+cache:
+  paths:
+    - vendor/**/*
+    - node_modules/**/*
+    - .yarn/cache/**/*
+CISPEC_EOF
+        ;;
+      laravel-api)
+        cat > "$INFRA_DIR/buildspecs/ci.yml" << 'CISPEC_EOF'
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      php: 8.3
+    commands:
+      - echo "Installing dependencies..."
+      - composer install --no-interaction --prefer-dist --optimize-autoloader
+
+  pre_build:
+    commands:
+      - echo "Preparing Laravel..."
+      - cp .env.example .env
+      - php artisan key:generate
+
+  build:
+    commands:
+      - echo "Running code style check..."
+      - vendor/bin/pint --test
+      - echo "Running tests..."
+      - php artisan test --compact
+
+cache:
+  paths:
+    - vendor/**/*
+CISPEC_EOF
+        ;;
+      nodejs)
+        cat > "$INFRA_DIR/buildspecs/ci.yml" << 'CISPEC_EOF'
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - echo "Installing dependencies..."
+      - corepack enable
+      - yarn install --immutable
+
+  build:
+    commands:
+      - echo "Running lint..."
+      - yarn lint || true
+      - echo "Running tests..."
+      - yarn test || true
+      - echo "Building..."
+      - yarn build
+
+cache:
+  paths:
+    - node_modules/**/*
+    - .yarn/cache/**/*
+CISPEC_EOF
+        ;;
+      *)
+        cat > "$INFRA_DIR/buildspecs/ci.yml" << 'CISPEC_EOF'
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - echo "CI stage - add your test commands here"
+CISPEC_EOF
+        ;;
+    esac
+    log_success "Created infra/aws/buildspecs/ci.yml"
+
+    # Generate buildspec for CD (common for all project types)
+    cat > "$INFRA_DIR/buildspecs/cd.yml" << 'CDSPEC_EOF'
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPOSITORY
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+
+  build:
+    commands:
+      - echo "Building Docker image..."
+      - docker build -t $IMAGE_URI:$IMAGE_TAG .
+      - docker tag $IMAGE_URI:$IMAGE_TAG $IMAGE_URI:latest
+
+  post_build:
+    commands:
+      - echo "Pushing Docker image to ECR..."
+      - docker push $IMAGE_URI:$IMAGE_TAG
+      - docker push $IMAGE_URI:latest
+      - echo "Updating ECS service..."
+      - aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
+      - echo "Deployment initiated successfully!"
+
+cache:
+  paths:
+    - '/root/.docker/**/*'
+CDSPEC_EOF
+    log_success "Created infra/aws/buildspecs/cd.yml"
+  fi
+
   log_success "Created infra/aws/main.tf"
 
   # Create variables.tf for AWS
@@ -1521,11 +2041,16 @@ EOF
   terraform -chdir="$INFRA_DIR" fmt > /dev/null
   log_success "Terraform files formatted"
 
-  # Create GitHub workflows for AWS
+  # Create GitHub workflows for AWS (only for amd64 - ARM uses CodePipeline)
   print_header "Step 6: Creating GitHub Workflows"
 
-  # Generate build steps based on project type (same as GCP)
-  case "$PROJECT_TYPE" in
+  if [[ "$CPU_ARCH" == "arm64" ]]; then
+    log_info "ARM64 architecture selected - skipping GitHub Actions workflows"
+    log_info "CI/CD will run on AWS CodePipeline with native ARM64 builds"
+    log_success "CodePipeline configured in main.tf"
+  else
+    # Generate build steps based on project type (same as GCP)
+    case "$PROJECT_TYPE" in
     nodejs)
       CI_BUILD_STEPS="      - name: Enable Corepack
         run: corepack enable
@@ -1821,6 +2346,15 @@ $(echo -e "$CD_BUILD_ENV_VARS")
     SECRET_ENV_BLOCK=""
   fi
 
+  # Determine GitHub runner and Docker platform based on CPU architecture
+  if [[ "$CPU_ARCH" == "arm64" ]]; then
+    GH_RUNNER="ubuntu-24.04-arm"
+    DOCKER_PLATFORM="linux/arm64"
+  else
+    GH_RUNNER="ubuntu-latest"
+    DOCKER_PLATFORM="linux/amd64"
+  fi
+
   # Create AWS CD workflow
   CD_CONTENT="name: CD
 
@@ -1843,7 +2377,7 @@ env:
 jobs:
   deploy:
     name: Build & Deploy
-    runs-on: ubuntu-latest
+    runs-on: $GH_RUNNER
     environment: Production
 
     steps:
@@ -1860,20 +2394,23 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 $CD_BUILD_STEPS
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: \${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ecr-\${{ env.SERVICE_NAME }}
+          IMAGE_TAG: \${{ github.sha }}
+        run: |
+          docker build -t \$ECR_REGISTRY/\$ECR_REPOSITORY:\$IMAGE_TAG .
+          docker tag \$ECR_REGISTRY/\$ECR_REPOSITORY:\$IMAGE_TAG \$ECR_REGISTRY/\$ECR_REPOSITORY:latest
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            \${{ steps.login-ecr.outputs.registry }}/ecr-\${{ env.SERVICE_NAME }}:\${{ github.sha }}
-            \${{ steps.login-ecr.outputs.registry }}/ecr-\${{ env.SERVICE_NAME }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Push Docker image
+        env:
+          ECR_REGISTRY: \${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ecr-\${{ env.SERVICE_NAME }}
+          IMAGE_TAG: \${{ github.sha }}
+        run: |
+          docker push \$ECR_REGISTRY/\$ECR_REPOSITORY:\$IMAGE_TAG
+          docker push \$ECR_REGISTRY/\$ECR_REPOSITORY:latest
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -1891,8 +2428,9 @@ $CD_BUILD_STEPS
 $(echo -e "$SECRET_ENV_BLOCK")
         run: terraform apply -var-file=terraform.tfvars -auto-approve -input=false"
 
-  echo -e "$CD_CONTENT" > "$WORKFLOWS_DIR/cd.yml"
-  log_success "Created .github/workflows/cd.yml"
+    echo -e "$CD_CONTENT" > "$WORKFLOWS_DIR/cd.yml"
+    log_success "Created .github/workflows/cd.yml"
+  fi
 
   # Run terraform if not skipped
   if [[ "$SKIP_TERRAFORM" != "true" ]]; then
