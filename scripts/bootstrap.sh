@@ -156,6 +156,10 @@ while [[ $# -gt 0 ]]; do
       RDS_PASSWORD="${1#*=}"
       shift
       ;;
+    --create-valkey)
+      CREATE_VALKEY=true
+      shift
+      ;;
     --org-name=*)
       ORG_NAME="${1#*=}"
       shift
@@ -204,6 +208,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --rds-database=NAME        Database name (default: from env DB_DATABASE or 'app')"
       echo "  --rds-username=USER        Database username (default: from env DB_USERNAME or 'postgres')"
       echo "  --rds-password=PASS        Database password (default: from env DB_PASSWORD)"
+      echo "  --create-valkey            Create ElastiCache Valkey (Redis-compatible, 20% cheaper)"
       echo ""
       echo "Project types:"
       echo "  nodejs       - Node.js project (yarn/npm build before Docker)"
@@ -1071,6 +1076,9 @@ create_rds        = $(if [[ "$CREATE_RDS" == "true" ]]; then echo "true"; else e
 rds_database_name = "${RDS_DATABASE:-${DB_DATABASE:-app}}"
 rds_username      = "${RDS_USERNAME:-${DB_USERNAME:-postgres}}"
 rds_password      = "${FINAL_RDS_PASSWORD}"
+
+# ElastiCache Valkey (cache.t4g.micro ~\$12/month - Redis-compatible, 20-33% cheaper)
+create_valkey = $(if [[ "$CREATE_VALKEY" == "true" ]]; then echo "true"; else echo "false"; fi)
 EOF
   log_success "Created infra/aws/terraform.tfvars"
 
@@ -1170,6 +1178,31 @@ module "rds_postgres" {
   }
 }
 
+# ElastiCache Valkey (Redis-compatible, 20-33% cheaper than Redis)
+module "elasticache_valkey" {
+  count  = var.create_valkey ? 1 : 0
+  source = "github.com/$TERRAFORM_MODULES_REPO//modules/aws/elasticache-valkey?ref=main"
+
+  cluster_id = "valkey-\${var.service_name}"
+  vpc_id     = var.vpc_id
+  subnet_ids = var.private_subnet_ids
+
+  # Allow connections from VPC CIDR (ECS tasks)
+  allowed_cidr_blocks = [data.aws_vpc.main.cidr_block]
+
+  # Economical settings (cache.t4g.micro ~\$12/month)
+  node_type          = "cache.t4g.micro"
+  num_cache_clusters = 1
+
+  # Security
+  at_rest_encryption_enabled = true
+  transit_encryption_enabled = false
+
+  tags = {
+    Service = var.service_name
+  }
+}
+
 # Secrets Manager - Terraform managed secrets with service prefix
 resource "aws_secretsmanager_secret" "secrets" {
   for_each = toset(var.secret_keys)
@@ -1191,13 +1224,17 @@ resource "aws_secretsmanager_secret_version" "secrets" {
   }
 }
 
-# Merge RDS endpoint into env_vars when RDS is created
+# Merge RDS and Valkey endpoints into env_vars when created
 locals {
   rds_env_vars = var.create_rds ? {
     DB_HOST = module.rds_postgres[0].address
     DB_PORT = tostring(module.rds_postgres[0].port)
   } : {}
-  final_env_vars = merge(var.env_vars, local.rds_env_vars)
+  valkey_env_vars = var.create_valkey ? {
+    REDIS_HOST = module.elasticache_valkey[0].primary_endpoint
+    REDIS_PORT = tostring(module.elasticache_valkey[0].port)
+  } : {}
+  final_env_vars = merge(var.env_vars, local.rds_env_vars, local.valkey_env_vars)
 }
 
 module "ecs_fargate" {
@@ -1234,7 +1271,7 @@ module "ecs_fargate" {
   deletion_protection = var.deletion_protection
   assign_public_ip    = var.assign_public_ip
 
-  depends_on = [module.ecr, module.rds_postgres, aws_secretsmanager_secret_version.secrets]
+  depends_on = [module.ecr, module.rds_postgres, module.elasticache_valkey, aws_secretsmanager_secret_version.secrets]
 }
 EOF
   log_success "Created infra/aws/main.tf"
@@ -1388,6 +1425,13 @@ variable "rds_password" {
   sensitive   = true
   default     = ""
 }
+
+# Valkey Variables
+variable "create_valkey" {
+  description = "Create ElastiCache Valkey instance (Redis-compatible)"
+  type        = bool
+  default     = false
+}
 EOF
   log_success "Created infra/aws/variables.tf"
 
@@ -1437,6 +1481,27 @@ output "rds_address" {
 output "rds_database_name" {
   description = "RDS database name"
   value       = var.create_rds ? module.rds_postgres[0].database_name : null
+}
+
+# Valkey outputs (only when create_valkey = true)
+output "valkey_primary_endpoint" {
+  description = "Valkey primary endpoint"
+  value       = var.create_valkey ? module.elasticache_valkey[0].primary_endpoint : null
+}
+
+output "valkey_reader_endpoint" {
+  description = "Valkey reader endpoint"
+  value       = var.create_valkey ? module.elasticache_valkey[0].reader_endpoint : null
+}
+
+output "valkey_port" {
+  description = "Valkey port"
+  value       = var.create_valkey ? module.elasticache_valkey[0].port : null
+}
+
+output "valkey_redis_url" {
+  description = "Redis-compatible connection URL"
+  value       = var.create_valkey ? module.elasticache_valkey[0].redis_url : null
 }
 EOF
   log_success "Created infra/aws/outputs.tf"
