@@ -1860,23 +1860,20 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 $CD_BUILD_STEPS
-      - name: Build Docker image
-        env:
-          ECR_REGISTRY: \${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ecr-\${{ env.SERVICE_NAME }}
-          IMAGE_TAG: \${{ github.sha }}
-        run: |
-          docker build -t \$ECR_REGISTRY/\$ECR_REPOSITORY:\$IMAGE_TAG .
-          docker tag \$ECR_REGISTRY/\$ECR_REPOSITORY:\$IMAGE_TAG \$ECR_REGISTRY/\$ECR_REPOSITORY:latest
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Push Docker image
-        env:
-          ECR_REGISTRY: \${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ecr-\${{ env.SERVICE_NAME }}
-          IMAGE_TAG: \${{ github.sha }}
-        run: |
-          docker push \$ECR_REGISTRY/\$ECR_REPOSITORY:\$IMAGE_TAG
-          docker push \$ECR_REGISTRY/\$ECR_REPOSITORY:latest
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            \${{ steps.login-ecr.outputs.registry }}/ecr-\${{ env.SERVICE_NAME }}:\${{ github.sha }}
+            \${{ steps.login-ecr.outputs.registry }}/ecr-\${{ env.SERVICE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
