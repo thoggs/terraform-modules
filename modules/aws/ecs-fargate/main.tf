@@ -316,11 +316,12 @@ resource "aws_lb_listener" "https" {
 }
 
 resource "aws_ecs_service" "main" {
-  name            = var.service_name
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.main.arn
-  desired_count   = var.desired_count
-  launch_type     = "FARGATE"
+  name                 = var.service_name
+  cluster              = aws_ecs_cluster.main.id
+  task_definition      = aws_ecs_task_definition.main.arn
+  desired_count        = var.desired_count
+  launch_type          = "FARGATE"
+  force_new_deployment = true
 
   network_configuration {
     subnets          = var.private_subnet_ids
