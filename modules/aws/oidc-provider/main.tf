@@ -119,3 +119,64 @@ resource "aws_iam_role_policy" "pass_role" {
   role   = aws_iam_role.github_actions.id
   policy = data.aws_iam_policy_document.pass_role.json
 }
+
+# IAM permissions for Terraform to manage OIDC provider
+data "aws_iam_policy_document" "iam_oidc" {
+  statement {
+    actions = [
+      "iam:GetOpenIDConnectProvider",
+      "iam:CreateOpenIDConnectProvider",
+      "iam:DeleteOpenIDConnectProvider",
+      "iam:UpdateOpenIDConnectProviderThumbprint",
+      "iam:TagOpenIDConnectProvider",
+      "iam:UntagOpenIDConnectProvider",
+      "iam:ListOpenIDConnectProviders"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+
+  statement {
+    actions = [
+      "iam:GetRole",
+      "iam:CreateRole",
+      "iam:DeleteRole",
+      "iam:UpdateRole",
+      "iam:TagRole",
+      "iam:UntagRole",
+      "iam:ListRolePolicies",
+      "iam:GetRolePolicy",
+      "iam:PutRolePolicy",
+      "iam:DeleteRolePolicy",
+      "iam:AttachRolePolicy",
+      "iam:DetachRolePolicy",
+      "iam:ListAttachedRolePolicies",
+      "iam:ListInstanceProfilesForRole"
+    ]
+    effect    = "Allow"
+    resources = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/*"]
+  }
+}
+
+resource "aws_iam_role_policy" "iam_oidc" {
+  name   = "iam-oidc-management"
+  role   = aws_iam_role.github_actions.id
+  policy = data.aws_iam_policy_document.iam_oidc.json
+}
+
+# RDS permissions for Terraform (always enabled - needed for infra management)
+data "aws_iam_policy_document" "rds" {
+  statement {
+    actions = [
+      "rds:*"
+    ]
+    effect    = "Allow"
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "rds" {
+  name   = "rds-management"
+  role   = aws_iam_role.github_actions.id
+  policy = data.aws_iam_policy_document.rds.json
+}

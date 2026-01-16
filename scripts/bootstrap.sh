@@ -977,7 +977,9 @@ if [[ "$PROVIDER" == "aws" ]]; then
     fi
 
     # Also update the secret in AWS Secrets Manager if it exists
-    SECRET_NAME="${SERVICE_NAME}/DB_PASSWORD"
+    # Terraform creates secrets with lowercase and hyphens: DB_PASSWORD -> db-password
+    SECRET_NAME="${SERVICE_NAME}/db-password"
+    SECRET_UPDATED=false
     if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" --region "$REGION" &>/dev/null; then
       log_info "Updating DB_PASSWORD in AWS Secrets Manager..."
       if aws secretsmanager put-secret-value \
@@ -985,8 +987,24 @@ if [[ "$PROVIDER" == "aws" ]]; then
         --secret-string "$FINAL_RDS_PASSWORD" \
         --region "$REGION" &>/dev/null; then
         log_success "AWS Secrets Manager secret updated"
+        SECRET_UPDATED=true
       else
         log_warn "Could not update AWS Secrets Manager secret"
+      fi
+    fi
+
+    # Force ECS deployment if secrets were updated (so tasks reload the new values)
+    ECS_CLUSTER="ecs-${SERVICE_NAME}"
+    if [[ "$SECRET_UPDATED" == "true" ]] && aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$SERVICE_NAME" --region "$REGION" &>/dev/null; then
+      log_info "Forcing ECS deployment to reload updated secrets..."
+      if aws ecs update-service \
+        --cluster "$ECS_CLUSTER" \
+        --service "$SERVICE_NAME" \
+        --force-new-deployment \
+        --region "$REGION" &>/dev/null; then
+        log_success "ECS deployment triggered"
+      else
+        log_warn "Could not trigger ECS deployment"
       fi
     fi
   fi
