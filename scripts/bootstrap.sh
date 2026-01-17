@@ -168,6 +168,18 @@ while [[ $# -gt 0 ]]; do
       ORG_NAME="${1#*=}"
       shift
       ;;
+    --dockerhub-username=*)
+      DOCKERHUB_USERNAME="${1#*=}"
+      shift
+      ;;
+    --dockerhub-token=*)
+      DOCKERHUB_TOKEN="${1#*=}"
+      shift
+      ;;
+    --github-token=*)
+      GITHUB_TOKEN="${1#*=}"
+      shift
+      ;;
     --help)
       echo "Usage: ./bootstrap.sh [options]"
       echo ""
@@ -214,6 +226,9 @@ while [[ $# -gt 0 ]]; do
       echo "  --rds-username=USER        Database username (default: from env DB_USERNAME or 'postgres')"
       echo "  --rds-password=PASS        Database password (default: from env DB_PASSWORD)"
       echo "  --create-valkey            Create ElastiCache Valkey (Redis-compatible, 20% cheaper)"
+      echo "  --dockerhub-username=USER  Docker Hub username (avoids rate limiting in CI)"
+      echo "  --dockerhub-token=TOKEN    Docker Hub access token (avoids rate limiting in CI)"
+      echo "  --github-token=TOKEN       GitHub PAT for CodeBuild webhooks (PRs to develop)"
       echo ""
       echo "Project types:"
       echo "  nodejs       - Node.js project (yarn/npm build before Docker)"
@@ -594,6 +609,21 @@ if [[ "$PROVIDER" == "aws" ]]; then
     fi
   fi
 
+  # Final check: if we have a custom domain but no certificate ARN, check for ISSUED certificate
+  # This handles the case where bootstrap was run before and cert was pending, but is now issued
+  if [[ -n "$CUSTOM_DOMAIN" && -z "$CERTIFICATE_ARN" ]]; then
+    log_info "Checking for existing ISSUED certificate for $CUSTOM_DOMAIN..."
+    ISSUED_CERT=$(aws acm list-certificates --region "$REGION" \
+      --certificate-statuses ISSUED \
+      --query "CertificateSummaryList[?DomainName=='$CUSTOM_DOMAIN'].CertificateArn" \
+      --output text 2>/dev/null || echo "")
+
+    if [[ -n "$ISSUED_CERT" && "$ISSUED_CERT" != "None" ]]; then
+      CERTIFICATE_ARN="$ISSUED_CERT"
+      log_success "Found ISSUED certificate: $CERTIFICATE_ARN"
+    fi
+  fi
+
   # Create ECR repository and push initial image
   print_header "Step 3: Creating ECR Repository & Pushing Initial Image"
 
@@ -610,7 +640,7 @@ if [[ "$PROVIDER" == "aws" ]]; then
       --encryption-configuration encryptionType=AES256
     log_success "ECR repository created"
 
-    # Set lifecycle policy to keep only 10 images
+    # Set lifecycle policy to keep only 1 image
     log_info "Setting lifecycle policy..."
     aws ecr put-lifecycle-policy \
       --repository-name "$ECR_REPO_NAME" \
@@ -619,11 +649,37 @@ if [[ "$PROVIDER" == "aws" ]]; then
         "rules": [
           {
             "rulePriority": 1,
-            "description": "Keep only 10 images",
+            "description": "Delete untagged images immediately",
+            "selection": {
+              "tagStatus": "untagged",
+              "countType": "sinceImagePushed",
+              "countUnit": "days",
+              "countNumber": 1
+            },
+            "action": {
+              "type": "expire"
+            }
+          },
+          {
+            "rulePriority": 2,
+            "description": "Keep only 1 tagged image",
+            "selection": {
+              "tagStatus": "tagged",
+              "tagPrefixList": ["latest"],
+              "countType": "imageCountMoreThan",
+              "countNumber": 1
+            },
+            "action": {
+              "type": "expire"
+            }
+          },
+          {
+            "rulePriority": 3,
+            "description": "Keep only 1 commit-tagged image",
             "selection": {
               "tagStatus": "any",
               "countType": "imageCountMoreThan",
-              "countNumber": 10
+              "countNumber": 2
             },
             "action": {
               "type": "expire"
@@ -631,7 +687,7 @@ if [[ "$PROVIDER" == "aws" ]]; then
           }
         ]
       }'
-    log_success "Lifecycle policy configured"
+    log_success "Lifecycle policy configured (keeps only 1 image)"
   else
     log_warn "ECR repository $ECR_REPO_NAME already exists"
   fi
@@ -1036,10 +1092,14 @@ if [[ "$PROVIDER" == "aws" ]]; then
     fi
   fi
 
+  # Extract org name from GitHub repo (owner/repo -> owner)
+  ORG_NAME=$(echo "$GITHUB_REPO" | cut -d'/' -f1 | tr '[:upper:]' '[:lower:]')
+
   # Create terraform.tfvars for AWS
   cat > "$INFRA_DIR/terraform.tfvars" << EOF
 region           = "$REGION"
 service_name     = "$SERVICE_NAME"
+org_name         = "$ORG_NAME"
 github_repo      = "$GITHUB_REPO"
 
 vpc_id             = "$VPC_ID"
@@ -1085,18 +1145,29 @@ rds_password      = "${FINAL_RDS_PASSWORD}"
 
 # ElastiCache Valkey (cache.t4g.micro ~\$12/month - Redis-compatible, 20-33% cheaper)
 create_valkey = $(if [[ "$CREATE_VALKEY" == "true" ]]; then echo "true"; else echo "false"; fi)
+
+# Docker Hub credentials (optional - avoids rate limiting in CI)
+dockerhub_username = "${DOCKERHUB_USERNAME:-}"
+dockerhub_token    = "${DOCKERHUB_TOKEN:-}"
+
+# GitHub token for CodeBuild webhooks (CI on PRs to develop)
+github_token = "${GITHUB_TOKEN:-}"
 EOF
   log_success "Created infra/aws/terraform.tfvars"
 
   # Create main.tf for AWS
   cat > "$INFRA_DIR/main.tf" << EOF
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.10"
 
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.0"
+    }
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.2"
     }
   }
 
@@ -1141,7 +1212,7 @@ module "ecr" {
   image_tag_mutability = "MUTABLE"
   scan_on_push         = true
   force_delete         = true
-  keep_image_count     = 10
+  keep_image_count     = 1
 }
 
 # VPC data for CIDR block
@@ -1281,13 +1352,29 @@ module "ecs_fargate" {
 }
 EOF
 
-  # Add CodeBuild and CodePipeline for ARM architecture
+  # Add CodeBuild CI/CD with webhooks for ARM architecture
   if [[ "$CPU_ARCH" == "arm64" ]]; then
     cat >> "$INFRA_DIR/main.tf" << 'CODEBUILD_EOF'
 
 # =============================================================================
-# CodeBuild & CodePipeline (ARM64 Native Build)
+# CodeBuild CI (PRs to develop) & CD (push to main) with GitHub Webhooks
 # =============================================================================
+
+# Docker Hub credentials secret (avoids rate limiting)
+resource "aws_secretsmanager_secret" "dockerhub" {
+  count       = var.dockerhub_username != "" ? 1 : 0
+  name        = "${var.service_name}/dockerhub"
+  description = "Docker Hub credentials for ${var.service_name}"
+}
+
+resource "aws_secretsmanager_secret_version" "dockerhub" {
+  count     = var.dockerhub_username != "" ? 1 : 0
+  secret_id = aws_secretsmanager_secret.dockerhub[0].id
+  secret_string = jsonencode({
+    username = var.dockerhub_username
+    password = var.dockerhub_token
+  })
+}
 
 # CodeBuild IAM Role
 resource "aws_iam_role" "codebuild" {
@@ -1338,21 +1425,12 @@ resource "aws_iam_role_policy" "codebuild" {
       {
         Effect = "Allow"
         Action = [
-          "s3:GetObject",
-          "s3:GetObjectVersion",
-          "s3:PutObject"
-        ]
-        Resource = [
-          "${aws_s3_bucket.codepipeline.arn}",
-          "${aws_s3_bucket.codepipeline.arn}/*"
-        ]
-      },
-      {
-        Effect = "Allow"
-        Action = [
           "secretsmanager:GetSecretValue"
         ]
-        Resource = [for s in aws_secretsmanager_secret.secrets : s.arn]
+        Resource = concat(
+          [for s in aws_secretsmanager_secret.secrets : s.arn],
+          var.dockerhub_username != "" ? [aws_secretsmanager_secret.dockerhub[0].arn] : []
+        )
       },
       {
         Effect = "Allow"
@@ -1369,23 +1447,26 @@ resource "aws_iam_role_policy" "codebuild" {
   })
 }
 
-# CodeBuild Project - CI (Tests)
+# =============================================================================
+# CI: CodeBuild with GitHub Webhook (PRs to develop)
+# =============================================================================
+
 resource "aws_codebuild_project" "ci" {
   name          = "${var.service_name}-ci"
-  description   = "CI pipeline for ${var.service_name} - runs tests"
-  build_timeout = 15
+  description   = "CI for ${var.service_name} - runs tests on PRs to develop"
+  build_timeout = 30
   service_role  = aws_iam_role.codebuild.arn
 
   artifacts {
-    type = "CODEPIPELINE"
+    type = "NO_ARTIFACTS"
   }
 
   environment {
-    compute_type                = "BUILD_GENERAL1_SMALL"
+    compute_type                = "BUILD_GENERAL1_LARGE"
     image                       = "aws/codebuild/amazonlinux2-aarch64-standard:3.0"
     type                        = "ARM_CONTAINER"
     image_pull_credentials_type = "CODEBUILD"
-    privileged_mode             = false
+    privileged_mode             = true
 
     environment_variable {
       name  = "SERVICE_NAME"
@@ -1394,8 +1475,11 @@ resource "aws_codebuild_project" "ci" {
   }
 
   source {
-    type      = "CODEPIPELINE"
-    buildspec = "infra/aws/buildspecs/ci.yml"
+    type            = "GITHUB"
+    location        = "https://github.com/${var.github_repo}.git"
+    git_clone_depth = 1
+    buildspec       = "infra/aws/buildspecs/ci.yml"
+    report_build_status = true
   }
 
   logs_config {
@@ -1411,19 +1495,70 @@ resource "aws_codebuild_project" "ci" {
   }
 }
 
-# CodeBuild Project - CD (Build & Deploy)
+# GitHub credentials for CodeBuild (required for webhooks)
+resource "aws_codebuild_source_credential" "github" {
+  count       = var.github_token != "" ? 1 : 0
+  auth_type   = "PERSONAL_ACCESS_TOKEN"
+  server_type = "GITHUB"
+  token       = var.github_token
+}
+
+# Webhook for CI - triggers on PRs to develop
+resource "aws_codebuild_webhook" "ci" {
+  count        = var.github_token != "" ? 1 : 0
+  project_name = aws_codebuild_project.ci.name
+  build_type   = "BUILD"
+
+  filter_group {
+    filter {
+      type    = "EVENT"
+      pattern = "PULL_REQUEST_CREATED,PULL_REQUEST_UPDATED,PULL_REQUEST_REOPENED"
+    }
+    filter {
+      type    = "BASE_REF"
+      pattern = "^refs/heads/develop$"
+    }
+  }
+
+  depends_on = [aws_codebuild_source_credential.github]
+}
+
+# Disable comment approval requirement for CI webhook (solo developers / private repos)
+resource "null_resource" "ci_webhook_no_approval" {
+  count = var.github_token != "" ? 1 : 0
+
+  triggers = {
+    webhook_url = aws_codebuild_webhook.ci[0].url
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws codebuild update-webhook \
+        --project-name ${aws_codebuild_project.ci.name} \
+        --region ${var.region} \
+        --pull-request-build-policy '{"requiresCommentApproval":"DISABLED"}'
+    EOT
+  }
+
+  depends_on = [aws_codebuild_webhook.ci]
+}
+
+# =============================================================================
+# CD: CodeBuild with Webhook (push to main)
+# =============================================================================
+
 resource "aws_codebuild_project" "cd" {
   name          = "${var.service_name}-cd"
-  description   = "CD pipeline for ${var.service_name} - builds and deploys"
+  description   = "CD for ${var.service_name} - builds and deploys on push to main"
   build_timeout = 30
   service_role  = aws_iam_role.codebuild.arn
 
   artifacts {
-    type = "CODEPIPELINE"
+    type = "NO_ARTIFACTS"
   }
 
   environment {
-    compute_type                = "BUILD_GENERAL1_SMALL"
+    compute_type                = "BUILD_GENERAL1_LARGE"
     image                       = "aws/codebuild/amazonlinux2-aarch64-standard:3.0"
     type                        = "ARM_CONTAINER"
     image_pull_credentials_type = "CODEBUILD"
@@ -1461,8 +1596,10 @@ resource "aws_codebuild_project" "cd" {
   }
 
   source {
-    type      = "CODEPIPELINE"
-    buildspec = "infra/aws/buildspecs/cd.yml"
+    type            = "GITHUB"
+    location        = "https://github.com/${var.github_repo}.git"
+    git_clone_depth = 1
+    buildspec       = "infra/aws/buildspecs/cd.yml"
   }
 
   logs_config {
@@ -1478,173 +1615,40 @@ resource "aws_codebuild_project" "cd" {
   }
 }
 
-# S3 Bucket for CodePipeline artifacts
-resource "aws_s3_bucket" "codepipeline" {
-  bucket        = "${var.service_name}-${var.org_name}-pipeline"
-  force_destroy = true
+# Webhook for CD - triggers on push to main
+resource "aws_codebuild_webhook" "cd" {
+  count        = var.github_token != "" ? 1 : 0
+  project_name = aws_codebuild_project.cd.name
+  build_type   = "BUILD"
 
-  tags = {
-    Service = var.service_name
+  filter_group {
+    filter {
+      type    = "EVENT"
+      pattern = "PUSH"
+    }
+    filter {
+      type    = "HEAD_REF"
+      pattern = "^refs/heads/main$"
+    }
   }
-}
 
-resource "aws_s3_bucket_versioning" "codepipeline" {
-  bucket = aws_s3_bucket.codepipeline.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# CodePipeline IAM Role
-resource "aws_iam_role" "codepipeline" {
-  name = "codepipeline-${var.service_name}-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "codepipeline.amazonaws.com"
-      }
-    }]
-  })
-}
-
-resource "aws_iam_role_policy" "codepipeline" {
-  name = "codepipeline-${var.service_name}-policy"
-  role = aws_iam_role.codepipeline.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:GetObjectVersion",
-          "s3:GetBucketVersioning",
-          "s3:PutObject",
-          "s3:PutObjectAcl"
-        ]
-        Resource = [
-          "${aws_s3_bucket.codepipeline.arn}",
-          "${aws_s3_bucket.codepipeline.arn}/*"
-        ]
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "codestar-connections:UseConnection"
-        ]
-        Resource = aws_codestarconnections_connection.github.arn
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "codebuild:BatchGetBuilds",
-          "codebuild:StartBuild"
-        ]
-        Resource = [
-          aws_codebuild_project.ci.arn,
-          aws_codebuild_project.cd.arn
-        ]
-      }
-    ]
-  })
-}
-
-# GitHub Connection (CodeStar)
-resource "aws_codestarconnections_connection" "github" {
-  name          = "${var.service_name}-github"
-  provider_type = "GitHub"
+  depends_on = [aws_codebuild_source_credential.github]
 }
 
 # Data source for current AWS account
 data "aws_caller_identity" "current" {}
 
-# CodePipeline
-resource "aws_codepipeline" "main" {
-  name     = "${var.service_name}-pipeline"
-  role_arn = aws_iam_role.codepipeline.arn
-
-  artifact_store {
-    location = aws_s3_bucket.codepipeline.bucket
-    type     = "S3"
-  }
-
-  stage {
-    name = "Source"
-
-    action {
-      name             = "GitHub"
-      category         = "Source"
-      owner            = "AWS"
-      provider         = "CodeStarSourceConnection"
-      version          = "1"
-      output_artifacts = ["source_output"]
-
-      configuration = {
-        ConnectionArn    = aws_codestarconnections_connection.github.arn
-        FullRepositoryId = var.github_repo
-        BranchName       = "main"
-      }
-    }
-  }
-
-  stage {
-    name = "CI"
-
-    action {
-      name             = "Test"
-      category         = "Build"
-      owner            = "AWS"
-      provider         = "CodeBuild"
-      version          = "1"
-      input_artifacts  = ["source_output"]
-      output_artifacts = ["ci_output"]
-
-      configuration = {
-        ProjectName = aws_codebuild_project.ci.name
-      }
-    }
-  }
-
-  stage {
-    name = "CD"
-
-    action {
-      name             = "Build-Deploy"
-      category         = "Build"
-      owner            = "AWS"
-      provider         = "CodeBuild"
-      version          = "1"
-      input_artifacts  = ["source_output"]
-      output_artifacts = ["cd_output"]
-
-      configuration = {
-        ProjectName = aws_codebuild_project.cd.name
-      }
-    }
-  }
-
-  tags = {
-    Service = var.service_name
-  }
+output "codebuild_ci_url" {
+  description = "CI CodeBuild URL (triggered by PRs to develop)"
+  value       = "https://${var.region}.console.aws.amazon.com/codesuite/codebuild/projects/${aws_codebuild_project.ci.name}"
 }
 
-# Output the connection status (needs manual approval in AWS Console)
-output "github_connection_status" {
-  description = "GitHub connection status - must be AVAILABLE (approve in AWS Console > CodePipeline > Settings > Connections)"
-  value       = aws_codestarconnections_connection.github.connection_status
-}
-
-output "codepipeline_url" {
-  description = "CodePipeline URL"
-  value       = "https://${var.region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${aws_codepipeline.main.name}/view"
+output "codebuild_cd_url" {
+  description = "CD CodeBuild URL (triggered by push to main)"
+  value       = "https://${var.region}.console.aws.amazon.com/codesuite/codebuild/projects/${aws_codebuild_project.cd.name}"
 }
 CODEBUILD_EOF
-    log_success "Added CodeBuild and CodePipeline resources to main.tf"
+    log_success "Added CodeBuild CI and CD resources with webhooks to main.tf"
 
     # Create buildspecs directory
     mkdir -p "$INFRA_DIR/buildspecs"
@@ -1655,67 +1659,80 @@ CODEBUILD_EOF
         cat > "$INFRA_DIR/buildspecs/ci.yml" << 'CISPEC_EOF'
 version: 0.2
 
+env:
+  secrets-manager:
+    DOCKERHUB_USERNAME: "${SERVICE_NAME}/dockerhub:username"
+    DOCKERHUB_TOKEN: "${SERVICE_NAME}/dockerhub:password"
+
 phases:
   install:
-    runtime-versions:
-      php: 8.3
-      nodejs: 20
     commands:
-      - echo "Installing dependencies..."
-      - composer install --no-interaction --prefer-dist --optimize-autoloader
-      - corepack enable
-      - yarn install --immutable
+      - echo "Logging in to Docker Hub..."
+      - |
+        if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          echo "Docker Hub login successful"
+        fi
 
   pre_build:
     commands:
-      - echo "Preparing Laravel..."
-      - cp .env.example .env
-      - php artisan key:generate
-
-  build:
-    commands:
-      - echo "Building frontend assets..."
-      - yarn build
-      - echo "Running code style check..."
-      - vendor/bin/pint --test
-      - echo "Running tests..."
-      - php artisan test --compact
+      - echo "Running CI with PHP 8.4 + Node 24 on ARM64..."
+      - |
+        docker run --rm -v "$CODEBUILD_SRC_DIR:/app" -w /app php:8.4-cli-alpine sh -c "
+          apk add --no-cache curl git unzip nodejs=~24 linux-headers \$PHPIZE_DEPS &&
+          docker-php-ext-install pcntl &&
+          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer &&
+          composer install --no-interaction --prefer-dist --optimize-autoloader &&
+          node .yarn/releases/yarn-*.cjs install --immutable &&
+          cp .env.example .env &&
+          php artisan key:generate &&
+          node .yarn/releases/yarn-*.cjs build &&
+          vendor/bin/pint --test &&
+          php artisan test --compact
+        "
 
 cache:
   paths:
-    - vendor/**/*
-    - node_modules/**/*
-    - .yarn/cache/**/*
+    - '/root/.docker/**/*'
 CISPEC_EOF
         ;;
       laravel-api)
         cat > "$INFRA_DIR/buildspecs/ci.yml" << 'CISPEC_EOF'
 version: 0.2
 
+env:
+  secrets-manager:
+    DOCKERHUB_USERNAME: "${SERVICE_NAME}/dockerhub:username"
+    DOCKERHUB_TOKEN: "${SERVICE_NAME}/dockerhub:password"
+
 phases:
   install:
-    runtime-versions:
-      php: 8.3
     commands:
-      - echo "Installing dependencies..."
-      - composer install --no-interaction --prefer-dist --optimize-autoloader
+      - echo "Logging in to Docker Hub..."
+      - |
+        if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          echo "Docker Hub login successful"
+        fi
 
   pre_build:
     commands:
-      - echo "Preparing Laravel..."
-      - cp .env.example .env
-      - php artisan key:generate
-
-  build:
-    commands:
-      - echo "Running code style check..."
-      - vendor/bin/pint --test
-      - echo "Running tests..."
-      - php artisan test --compact
+      - echo "Running CI with PHP 8.4 on ARM64..."
+      - |
+        docker run --rm -v "$CODEBUILD_SRC_DIR:/app" -w /app php:8.4-cli-alpine sh -c "
+          apk add --no-cache curl git unzip linux-headers \$PHPIZE_DEPS &&
+          docker-php-ext-install pcntl &&
+          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer &&
+          composer install --no-interaction --prefer-dist --optimize-autoloader &&
+          cp .env.example .env &&
+          php artisan key:generate &&
+          vendor/bin/pint --test &&
+          php artisan test --compact
+        "
 
 cache:
   paths:
-    - vendor/**/*
+    - '/root/.docker/**/*'
 CISPEC_EOF
         ;;
       nodejs)
@@ -1763,9 +1780,33 @@ CISPEC_EOF
     cat > "$INFRA_DIR/buildspecs/cd.yml" << 'CDSPEC_EOF'
 version: 0.2
 
+env:
+  secrets-manager:
+    DOCKERHUB_USERNAME: "${SERVICE_NAME}/dockerhub:username"
+    DOCKERHUB_TOKEN: "${SERVICE_NAME}/dockerhub:password"
+
 phases:
+  install:
+    commands:
+      - echo "Logging in to Docker Hub..."
+      - |
+        if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          echo "Docker Hub login successful"
+        fi
+
   pre_build:
     commands:
+      - echo "Building frontend assets with PHP 8.4 + Node 24..."
+      - |
+        docker run --rm -v "$CODEBUILD_SRC_DIR:/app" -w /app php:8.4-cli-alpine sh -c "
+          apk add --no-cache curl git unzip nodejs=~24 linux-headers \$PHPIZE_DEPS &&
+          docker-php-ext-install pcntl &&
+          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer &&
+          composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev &&
+          node .yarn/releases/yarn-*.cjs install --immutable &&
+          node .yarn/releases/yarn-*.cjs build
+        "
       - echo "Logging in to Amazon ECR..."
       - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
       - IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPOSITORY
@@ -1790,6 +1831,9 @@ phases:
 cache:
   paths:
     - '/root/.docker/**/*'
+    - 'vendor/**/*'
+    - 'node_modules/**/*'
+    - '.yarn/cache/**/*'
 CDSPEC_EOF
     log_success "Created infra/aws/buildspecs/cd.yml"
   fi
@@ -1806,6 +1850,11 @@ variable "region" {
 
 variable "service_name" {
   description = "Service name (used for ECS service and resource naming)"
+  type        = string
+}
+
+variable "org_name" {
+  description = "Organization name (used for globally unique resource naming)"
   type        = string
 }
 
@@ -1952,6 +2001,27 @@ variable "create_valkey" {
   type        = bool
   default     = false
 }
+
+# Docker Hub credentials (to avoid rate limiting)
+variable "dockerhub_username" {
+  description = "Docker Hub username (optional, avoids rate limiting)"
+  type        = string
+  default     = ""
+}
+
+variable "dockerhub_token" {
+  description = "Docker Hub access token (optional, avoids rate limiting)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "github_token" {
+  description = "GitHub PAT for CodeBuild webhooks (CI on PRs to develop)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
 EOF
   log_success "Created infra/aws/variables.tf"
 
@@ -2041,13 +2111,13 @@ EOF
   terraform -chdir="$INFRA_DIR" fmt > /dev/null
   log_success "Terraform files formatted"
 
-  # Create GitHub workflows for AWS (only for amd64 - ARM uses CodePipeline)
+  # Create GitHub workflows for AWS (only for amd64 - ARM uses CodeBuild webhooks)
   print_header "Step 6: Creating GitHub Workflows"
 
   if [[ "$CPU_ARCH" == "arm64" ]]; then
     log_info "ARM64 architecture selected - skipping GitHub Actions workflows"
-    log_info "CI/CD will run on AWS CodePipeline with native ARM64 builds"
-    log_success "CodePipeline configured in main.tf"
+    log_info "CI/CD will run on AWS CodeBuild with GitHub webhooks for native ARM64 builds"
+    log_success "CodeBuild CI/CD configured in main.tf"
   else
     # Generate build steps based on project type (same as GCP)
     case "$PROJECT_TYPE" in
@@ -2444,13 +2514,29 @@ $(echo -e "$SECRET_ENV_BLOCK")
     fi
 
     log_info "Terraform init..."
-    terraform init
+    terraform init -upgrade
 
     # Import existing ECR repository if it exists
     ECR_REPO_NAME="ecr-${SERVICE_NAME}"
     if aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" --region "$REGION" &>/dev/null; then
       log_info "ECR repository '$ECR_REPO_NAME' already exists, importing..."
       terraform import -var-file=terraform.tfvars 'module.ecr.aws_ecr_repository.main' "$ECR_REPO_NAME" 2>/dev/null || true
+    fi
+
+    # Import existing secrets if they exist in AWS Secrets Manager
+    if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+      log_info "Checking for existing secrets to import..."
+      while IFS= read -r key; do
+        secret_name="${SERVICE_NAME}/$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+        secret_arn=$(aws secretsmanager describe-secret --secret-id "$secret_name" --region "$REGION" --query 'ARN' --output text 2>/dev/null || echo "")
+        if [[ -n "$secret_arn" && "$secret_arn" != "None" ]]; then
+          if ! terraform state show "aws_secretsmanager_secret.secrets[\"$key\"]" &>/dev/null; then
+            log_info "Secret '$secret_name' exists, importing..."
+            terraform import -var-file=terraform.tfvars "aws_secretsmanager_secret.secrets[\"$key\"]" "$secret_arn" 2>/dev/null || true
+            terraform import -var-file=terraform.tfvars "aws_secretsmanager_secret_version.secrets[\"$key\"]" "$secret_arn|AWSCURRENT" 2>/dev/null || true
+          fi
+        fi
+      done < "$SECRET_KEYS_FILE"
     fi
 
     # Build secret_values for local terraform commands
@@ -2502,68 +2588,77 @@ $(echo -e "$SECRET_ENV_BLOCK")
     log_warn "Skipped terraform (use --skip-terraform=false to run)"
   fi
 
-  # Configure GitHub secrets
-  print_header "Step 8: GitHub Secrets Configuration"
+  # Configure secrets based on architecture
+  if [[ "$CPU_ARCH" == "arm64" ]]; then
+    print_header "Step 8: AWS Secrets Manager (ARM64 CodeBuild)"
+    log_info "ARM64 uses AWS CodeBuild with webhooks - secrets are managed by Terraform in AWS Secrets Manager"
+    log_info "Secrets configured in terraform.tfvars → secret_keys"
+    log_info "Values are stored in AWS Secrets Manager with prefix: ${SERVICE_NAME}/"
+    log_success "No GitHub Secrets needed for ARM64 CodeBuild flow"
+  else
+    # Configure GitHub secrets (only for amd64 GitHub Actions flow)
+    print_header "Step 8: GitHub Secrets Configuration"
 
-  if command -v gh &> /dev/null; then
-    log_info "GitHub CLI detected. Checking authentication..."
+    if command -v gh &> /dev/null; then
+      log_info "GitHub CLI detected. Checking authentication..."
 
-    if gh auth token &>/dev/null; then
-      log_success "GitHub CLI authenticated"
+      if gh auth token &>/dev/null; then
+        log_success "GitHub CLI authenticated"
 
-      echo ""
-      CONFIGURE_SECRETS="false"
-      if [[ "$AUTO_APPROVE" == "true" ]]; then
-        CONFIGURE_SECRETS="true"
-      else
-        read -p "Configure GitHub secrets automatically? (y/n) " -n 1 -r < /dev/tty
         echo ""
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
+        CONFIGURE_SECRETS="false"
+        if [[ "$AUTO_APPROVE" == "true" ]]; then
           CONFIGURE_SECRETS="true"
-        fi
-      fi
-
-      if [[ "$CONFIGURE_SECRETS" == "true" ]]; then
-        log_info "Configuring GitHub secrets for $GITHUB_REPO (environment: Production)..."
-
-        gh api "repos/$GITHUB_REPO/environments/Production" --method PUT --silent 2>/dev/null || true
-
-        if [[ -n "$AWS_ROLE_ARN" ]]; then
-          echo "$AWS_ROLE_ARN" | gh secret set AWS_ROLE_ARN --repo="$GITHUB_REPO" --env=Production
-          log_success "Set AWS_ROLE_ARN"
+        else
+          read -p "Configure GitHub secrets automatically? (y/n) " -n 1 -r < /dev/tty
+          echo ""
+          if [[ $REPLY =~ ^[Yy]$ ]]; then
+            CONFIGURE_SECRETS="true"
+          fi
         fi
 
-        # Set build-time variables
-        if [[ -f "$BUILD_KEYS_FILE" ]] && [[ -s "$BUILD_KEYS_FILE" ]]; then
-          log_info "Creating GitHub Variables for build-time env vars..."
-          while IFS= read -r key && IFS= read -r value <&3; do
-            echo "$value" | gh variable set "$key" --repo="$GITHUB_REPO" --env=Production
-            log_success "Set variable: $key"
-          done < "$BUILD_KEYS_FILE" 3< "$BUILD_VALUES_FILE"
-        fi
+        if [[ "$CONFIGURE_SECRETS" == "true" ]]; then
+          log_info "Configuring GitHub secrets for $GITHUB_REPO (environment: Production)..."
 
-        # Set secrets for Terraform
-        if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
-          log_info "Creating GitHub Secrets for Terraform-managed secrets..."
-          while IFS= read -r key && IFS= read -r value <&3; do
-            echo "$value" | gh secret set "$key" --repo="$GITHUB_REPO" --env=Production
-            log_success "Set secret: $key"
-          done < "$SECRET_KEYS_FILE" 3< "$SECRET_VALUES_FILE"
-        fi
+          gh api "repos/$GITHUB_REPO/environments/Production" --method PUT --silent 2>/dev/null || true
 
-        log_success "GitHub secrets and variables configured in 'Production' environment!"
+          if [[ -n "$AWS_ROLE_ARN" ]]; then
+            echo "$AWS_ROLE_ARN" | gh secret set AWS_ROLE_ARN --repo="$GITHUB_REPO" --env=Production
+            log_success "Set AWS_ROLE_ARN"
+          fi
+
+          # Set build-time variables
+          if [[ -f "$BUILD_KEYS_FILE" ]] && [[ -s "$BUILD_KEYS_FILE" ]]; then
+            log_info "Creating GitHub Variables for build-time env vars..."
+            while IFS= read -r key && IFS= read -r value <&3; do
+              echo "$value" | gh variable set "$key" --repo="$GITHUB_REPO" --env=Production
+              log_success "Set variable: $key"
+            done < "$BUILD_KEYS_FILE" 3< "$BUILD_VALUES_FILE"
+          fi
+
+          # Set secrets for Terraform
+          if [[ -f "$SECRET_KEYS_FILE" ]] && [[ -s "$SECRET_KEYS_FILE" ]]; then
+            log_info "Creating GitHub Secrets for Terraform-managed secrets..."
+            while IFS= read -r key && IFS= read -r value <&3; do
+              echo "$value" | gh secret set "$key" --repo="$GITHUB_REPO" --env=Production
+              log_success "Set secret: $key"
+            done < "$SECRET_KEYS_FILE" 3< "$SECRET_VALUES_FILE"
+          fi
+
+          log_success "GitHub secrets and variables configured in 'Production' environment!"
+        else
+          log_warn "Skipped GitHub secrets configuration"
+        fi
       else
-        log_warn "Skipped GitHub secrets configuration"
+        log_warn "GitHub CLI not authenticated. Run: gh auth login"
       fi
     else
-      log_warn "GitHub CLI not authenticated. Run: gh auth login"
+      log_warn "GitHub CLI not found. Install it to auto-configure secrets: https://cli.github.com"
     fi
-  else
-    log_warn "GitHub CLI not found. Install it to auto-configure secrets: https://cli.github.com"
   fi
 
-  # Manual instructions if secrets not configured
-  if [[ -z "$AWS_ROLE_ARN" ]] || ! command -v gh &> /dev/null; then
+  # Manual instructions if secrets not configured (only for amd64 GitHub Actions flow)
+  if [[ "$CPU_ARCH" != "arm64" ]] && { [[ -z "$AWS_ROLE_ARN" ]] || ! command -v gh &> /dev/null; }; then
     echo ""
     echo "Add these secrets to your GitHub repository manually:"
     echo ""
@@ -3214,7 +3309,7 @@ log_success "Created infra/gcp/terraform.tfvars"
 # Create main.tf
 cat > "$INFRA_DIR/main.tf" << EOF
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.10"
 
   required_providers {
     google = {
@@ -3984,7 +4079,7 @@ if [[ "$SKIP_TERRAFORM" != "true" ]]; then
   fi
 
   log_info "Terraform init..."
-  terraform init
+  terraform init -upgrade
 
   # Build secret_values for local terraform commands
   SECRET_VALUES_VAR=""
