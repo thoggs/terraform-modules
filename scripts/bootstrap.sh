@@ -1784,56 +1784,36 @@ env:
   secrets-manager:
     DOCKERHUB_USERNAME: "${SERVICE_NAME}/dockerhub:username"
     DOCKERHUB_TOKEN: "${SERVICE_NAME}/dockerhub:password"
+  variables:
+    DOCKER_BUILDKIT: "1"
 
 phases:
-  install:
+  pre_build:
     commands:
-      - echo "Logging in to Docker Hub..."
       - |
         if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
           echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-          echo "Docker Hub login successful"
         fi
-
-  pre_build:
-    commands:
-      - echo "Building frontend assets with PHP 8.4 + Node 24..."
-      - |
-        docker run --rm -v "$CODEBUILD_SRC_DIR:/app" -w /app php:8.4-cli-alpine sh -c "
-          apk add --no-cache curl git unzip nodejs=~24 linux-headers \$PHPIZE_DEPS &&
-          docker-php-ext-install pcntl &&
-          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer &&
-          composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev &&
-          node .yarn/releases/yarn-*.cjs install --immutable &&
-          node .yarn/releases/yarn-*.cjs build
-        "
-      - echo "Logging in to Amazon ECR..."
       - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
       - IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPOSITORY
       - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
       - IMAGE_TAG=${COMMIT_HASH:=latest}
+      - BASE_IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/ecr-php-fpm-node:8.4-node24-alpine
 
   build:
     commands:
-      - echo "Building Docker image..."
-      - docker build -t $IMAGE_URI:$IMAGE_TAG .
-      - docker tag $IMAGE_URI:$IMAGE_TAG $IMAGE_URI:latest
+      - |
+        docker build \
+          --build-arg BASE_IMAGE=$BASE_IMAGE \
+          -t $IMAGE_URI:$IMAGE_TAG \
+          -t $IMAGE_URI:latest \
+          .
 
   post_build:
     commands:
-      - echo "Pushing Docker image to ECR..."
       - docker push $IMAGE_URI:$IMAGE_TAG
       - docker push $IMAGE_URI:latest
-      - echo "Updating ECS service..."
       - aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
-      - echo "Deployment initiated successfully!"
-
-cache:
-  paths:
-    - '/root/.docker/**/*'
-    - 'vendor/**/*'
-    - 'node_modules/**/*'
-    - '.yarn/cache/**/*'
 CDSPEC_EOF
     log_success "Created infra/aws/buildspecs/cd.yml"
   fi
