@@ -1761,13 +1761,6 @@ phases:
           vendor/bin/pint --test &&
           php artisan test --compact
         "
-
-cache:
-  paths:
-    - '/root/.docker/**/*'
-    - 'vendor/**/*'
-    - 'node_modules/**/*'
-    - '.yarn/cache/**/*'
 CISPEC_EOF
         ;;
       laravel-api)
@@ -1806,11 +1799,6 @@ phases:
           vendor/bin/pint --test &&
           php artisan test --compact
         "
-
-cache:
-  paths:
-    - '/root/.docker/**/*'
-    - 'vendor/**/*'
 CISPEC_EOF
         ;;
       nodejs)
@@ -1882,15 +1870,17 @@ phases:
 
   build:
     commands:
+      - CACHE_DIR=/root/.cache/buildkit
       - |
         docker buildx build \
           --build-arg BASE_IMAGE=$BASE_IMAGE \
-          --cache-from type=local,src=/root/.cache/buildkit \
-          --cache-to type=local,dest=/root/.cache/buildkit,mode=max \
+          --cache-from type=local,src=$CACHE_DIR \
+          --cache-to type=local,dest=$CACHE_DIR-new,mode=max \
           -t $IMAGE_URI:$IMAGE_TAG \
           -t $IMAGE_URI:latest \
           --push \
           .
+      - rm -rf $CACHE_DIR && mv $CACHE_DIR-new $CACHE_DIR
 
   post_build:
     commands:
@@ -1898,7 +1888,6 @@ phases:
 
 cache:
   paths:
-    - '/root/.docker/**/*'
     - '/root/.cache/buildkit/**/*'
 CDSPEC_EOF
     log_success "Created infra/aws/buildspecs/cd.yml"
