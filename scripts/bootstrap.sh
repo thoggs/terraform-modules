@@ -743,14 +743,17 @@ if [[ "$PROVIDER" == "aws" ]]; then
     esac
     cd - > /dev/null
 
-    log_info "Building Docker image (linux/amd64,linux/arm64)..."
+    DOCKER_PLATFORM="linux/${CPU_ARCH}"
+    log_info "Building Docker image (${DOCKER_PLATFORM})..."
 
     IMAGE_NAME="$ECR_REPO_URI:latest"
+    BASE_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/ecr-php-fpm-node:8.4-node24-alpine"
+
     if docker buildx version &>/dev/null; then
-      docker buildx create --name multiarch --use 2>/dev/null || docker buildx use multiarch 2>/dev/null || true
-      docker buildx build --platform linux/amd64,linux/arm64 -t "$IMAGE_NAME" "$OUTPUT_DIR" --push
+      docker buildx create --name builder --use 2>/dev/null || docker buildx use builder 2>/dev/null || true
+      docker buildx build --platform "$DOCKER_PLATFORM" --build-arg BASE_IMAGE="$BASE_IMAGE" -t "$IMAGE_NAME" "$OUTPUT_DIR" --push
     else
-      docker build -t "$IMAGE_NAME" "$OUTPUT_DIR"
+      docker build --build-arg BASE_IMAGE="$BASE_IMAGE" -t "$IMAGE_NAME" "$OUTPUT_DIR"
       log_info "Pushing image to ECR..."
       docker push "$IMAGE_NAME"
     fi
@@ -1472,6 +1475,16 @@ resource "aws_codebuild_project" "ci" {
       name  = "SERVICE_NAME"
       value = var.service_name
     }
+
+    environment_variable {
+      name  = "AWS_ACCOUNT_ID"
+      value = data.aws_caller_identity.current.account_id
+    }
+
+    environment_variable {
+      name  = "AWS_DEFAULT_REGION"
+      value = var.region
+    }
   }
 
   source {
@@ -1650,6 +1663,61 @@ output "codebuild_cd_url" {
 CODEBUILD_EOF
     log_success "Added CodeBuild CI and CD resources with webhooks to main.tf"
 
+    # Add S3 cache to CodeBuild projects if STORAGE_BUCKET is set
+    if [[ -n "$STORAGE_BUCKET" ]]; then
+      awk -v bucket="$STORAGE_BUCKET" '
+        /resource "aws_codebuild_project" "ci"/ { in_ci=1 }
+        /resource "aws_codebuild_project" "cd"/ { in_ci=0; in_cd=1 }
+        /resource "aws_codebuild_webhook"/ { in_cd=0 }
+
+        # Print the line
+        { print }
+
+        # After artifacts block closing brace, add cache
+        in_ci && /^  artifacts \{/ { in_artifacts_ci=1 }
+        in_ci && in_artifacts_ci && /^  \}$/ {
+          in_artifacts_ci=0
+          print ""
+          print "  cache {"
+          print "    type     = \"S3\""
+          print "    location = \"" bucket "/codebuild-cache/ci\""
+          print "  }"
+        }
+
+        in_cd && /^  artifacts \{/ { in_artifacts_cd=1 }
+        in_cd && in_artifacts_cd && /^  \}$/ {
+          in_artifacts_cd=0
+          print ""
+          print "  cache {"
+          print "    type     = \"S3\""
+          print "    location = \"" bucket "/codebuild-cache/cd\""
+          print "  }"
+        }
+      ' "$INFRA_DIR/main.tf" > "$INFRA_DIR/main.tf.tmp" && mv "$INFRA_DIR/main.tf.tmp" "$INFRA_DIR/main.tf"
+
+      # Add S3 cache permission to CodeBuild IAM policy
+      awk -v bucket="$STORAGE_BUCKET" '
+        /resource "aws_iam_role_policy" "codebuild"/ { in_policy=1 }
+        in_policy && /Resource = "\*"/ && found_ecs {
+          print
+          print "      },"
+          print "      {"
+          print "        Effect = \"Allow\""
+          print "        Action = ["
+          print "          \"s3:GetObject\","
+          print "          \"s3:PutObject\""
+          print "        ]"
+          print "        Resource = \"arn:aws:s3:::" bucket "/codebuild-cache/*\""
+          in_policy=0
+          next
+        }
+        in_policy && /"iam:PassRole"/ { found_ecs=1 }
+        { print }
+      ' "$INFRA_DIR/main.tf" > "$INFRA_DIR/main.tf.tmp" && mv "$INFRA_DIR/main.tf.tmp" "$INFRA_DIR/main.tf"
+
+      log_success "Added S3 cache to CodeBuild projects (bucket: $STORAGE_BUCKET)"
+    fi
+
     # Create buildspecs directory
     mkdir -p "$INFRA_DIR/buildspecs"
 
@@ -1663,30 +1731,33 @@ env:
   secrets-manager:
     DOCKERHUB_USERNAME: "${SERVICE_NAME}/dockerhub:username"
     DOCKERHUB_TOKEN: "${SERVICE_NAME}/dockerhub:password"
+  variables:
+    DOCKER_BUILDKIT: "1"
 
 phases:
   install:
     commands:
-      - echo "Logging in to Docker Hub..."
       - |
         if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
           echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-          echo "Docker Hub login successful"
         fi
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
 
   pre_build:
     commands:
+      - BASE_IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/ecr-php-fpm-node:8.4-node24-alpine
+      - docker pull $BASE_IMAGE
+
+  build:
+    commands:
       - echo "Running CI with PHP 8.4 + Node 24 on ARM64..."
       - |
-        docker run --rm -v "$CODEBUILD_SRC_DIR:/app" -w /app php:8.4-cli-alpine sh -c "
-          apk add --no-cache curl git unzip nodejs=~24 linux-headers \$PHPIZE_DEPS &&
-          docker-php-ext-install pcntl &&
-          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer &&
+        docker run --rm -v "$CODEBUILD_SRC_DIR:/app" -w /app $BASE_IMAGE sh -c "
           composer install --no-interaction --prefer-dist --optimize-autoloader &&
-          node .yarn/releases/yarn-*.cjs install --immutable &&
+          yarn install --immutable &&
           cp .env.example .env &&
           php artisan key:generate &&
-          node .yarn/releases/yarn-*.cjs build &&
+          yarn build &&
           vendor/bin/pint --test &&
           php artisan test --compact
         "
@@ -1694,6 +1765,9 @@ phases:
 cache:
   paths:
     - '/root/.docker/**/*'
+    - 'vendor/**/*'
+    - 'node_modules/**/*'
+    - '.yarn/cache/**/*'
 CISPEC_EOF
         ;;
       laravel-api)
@@ -1704,25 +1778,28 @@ env:
   secrets-manager:
     DOCKERHUB_USERNAME: "${SERVICE_NAME}/dockerhub:username"
     DOCKERHUB_TOKEN: "${SERVICE_NAME}/dockerhub:password"
+  variables:
+    DOCKER_BUILDKIT: "1"
 
 phases:
   install:
     commands:
-      - echo "Logging in to Docker Hub..."
       - |
         if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
           echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-          echo "Docker Hub login successful"
         fi
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
 
   pre_build:
     commands:
+      - BASE_IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/ecr-php-fpm-node:8.4-node24-alpine
+      - docker pull $BASE_IMAGE
+
+  build:
+    commands:
       - echo "Running CI with PHP 8.4 on ARM64..."
       - |
-        docker run --rm -v "$CODEBUILD_SRC_DIR:/app" -w /app php:8.4-cli-alpine sh -c "
-          apk add --no-cache curl git unzip linux-headers \$PHPIZE_DEPS &&
-          docker-php-ext-install pcntl &&
-          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer &&
+        docker run --rm -v "$CODEBUILD_SRC_DIR:/app" -w /app $BASE_IMAGE sh -c "
           composer install --no-interaction --prefer-dist --optimize-autoloader &&
           cp .env.example .env &&
           php artisan key:generate &&
@@ -1733,6 +1810,7 @@ phases:
 cache:
   paths:
     - '/root/.docker/**/*'
+    - 'vendor/**/*'
 CISPEC_EOF
         ;;
       nodejs)
@@ -1799,21 +1877,29 @@ phases:
       - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
       - IMAGE_TAG=${COMMIT_HASH:=latest}
       - BASE_IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/ecr-php-fpm-node:8.4-node24-alpine
+      - docker pull $BASE_IMAGE
+      - docker buildx create --driver docker-container --use --name builder || docker buildx use builder
 
   build:
     commands:
       - |
-        docker build \
+        docker buildx build \
           --build-arg BASE_IMAGE=$BASE_IMAGE \
+          --cache-from type=local,src=/root/.cache/buildkit \
+          --cache-to type=local,dest=/root/.cache/buildkit,mode=max \
           -t $IMAGE_URI:$IMAGE_TAG \
           -t $IMAGE_URI:latest \
+          --push \
           .
 
   post_build:
     commands:
-      - docker push $IMAGE_URI:$IMAGE_TAG
-      - docker push $IMAGE_URI:latest
       - aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
+
+cache:
+  paths:
+    - '/root/.docker/**/*'
+    - '/root/.cache/buildkit/**/*'
 CDSPEC_EOF
     log_success "Created infra/aws/buildspecs/cd.yml"
   fi
