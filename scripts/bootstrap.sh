@@ -1745,12 +1745,12 @@ phases:
 
   pre_build:
     commands:
-      - BASE_IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/ecr-php-fpm-node:8.4-node24-alpine
+      - BASE_IMAGE=$(grep -oE 'ARG BASE_IMAGE=[^ ]+' Dockerfile | cut -d= -f2)
       - docker pull $BASE_IMAGE
 
   build:
     commands:
-      - echo "Running CI with PHP 8.4 + Node 24 on ARM64..."
+      - echo "Running CI..."
       - |
         docker run --rm -v "$CODEBUILD_SRC_DIR:/app" -w /app $BASE_IMAGE sh -c "
           composer install --no-interaction --prefer-dist --optimize-autoloader &&
@@ -1785,12 +1785,12 @@ phases:
 
   pre_build:
     commands:
-      - BASE_IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/ecr-php-fpm-node:8.4-node24-alpine
+      - BASE_IMAGE=$(grep -oE 'ARG BASE_IMAGE=[^ ]+' Dockerfile | cut -d= -f2)
       - docker pull $BASE_IMAGE
 
   build:
     commands:
-      - echo "Running CI with PHP 8.4 on ARM64..."
+      - echo "Running CI..."
       - |
         docker run --rm -v "$CODEBUILD_SRC_DIR:/app" -w /app $BASE_IMAGE sh -c "
           composer install --no-interaction --prefer-dist --optimize-autoloader &&
@@ -1864,31 +1864,23 @@ phases:
       - IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPOSITORY
       - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
       - IMAGE_TAG=${COMMIT_HASH:=latest}
-      - BASE_IMAGE=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/ecr-php-fpm-node:8.4-node24-alpine
-      - docker pull $BASE_IMAGE
-      - docker buildx create --driver docker-container --use --name builder || docker buildx use builder
+      - docker pull $IMAGE_URI:latest || true
 
   build:
     commands:
-      - CACHE_DIR=/root/.cache/buildkit
       - |
-        docker buildx build \
-          --build-arg BASE_IMAGE=$BASE_IMAGE \
-          --cache-from type=local,src=$CACHE_DIR \
-          --cache-to type=local,dest=$CACHE_DIR-new,mode=max \
+        docker build \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          --cache-from $IMAGE_URI:latest \
           -t $IMAGE_URI:$IMAGE_TAG \
           -t $IMAGE_URI:latest \
-          --push \
           .
-      - rm -rf $CACHE_DIR && mv $CACHE_DIR-new $CACHE_DIR
+      - docker push $IMAGE_URI:$IMAGE_TAG
+      - docker push $IMAGE_URI:latest
 
   post_build:
     commands:
       - aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
-
-cache:
-  paths:
-    - '/root/.cache/buildkit/**/*'
 CDSPEC_EOF
     log_success "Created infra/aws/buildspecs/cd.yml"
   fi
